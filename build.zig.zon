@@ -1,0 +1,34 @@
+.{
+    .name = .zython,
+    .version = "0.1.0",
+    .fingerprint = 0x54f9bdea57a9757,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
+            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
+        },
+        // Python third-party packages vendored for Zython compatibility testing
+        // Uvicorn - ASGI server, tested to work with Zython's libxev asyncio backend
+        // Source: https://files.pythonhosted.org/packages/5e/42/e0e305207bb88c6b8d3061399c6a961ffe5fbb7e2aa63c9234df7259e9cd/uvicorn-0.35.0.tar.gz
+        // sha256: bc662f087f7cf2ce11a1d7fd70b90c9f98ef2e2831556dd078d131b96cc94a01
+        // We vendor it as path to avoid needing network in `zig fetch`, but it can also be fetched via URL:
+        // .uvicorn = .{
+        //     .url = "https://files.pythonhosted.org/packages/5e/42/e0e305207bb88c6b8d3061399c6a961ffe5fbb7e2aa63c9234df7259e9cd/uvicorn-0.35.0.tar.gz",
+        //     .hash = "1220bc662f087f7cf2ce11a1d7fd70b90c9f98ef2e2831556dd078d131b96cc94a01",
+        //     .lazy = true,
+        // },
+        .uvicorn = .{
+            .path = "vendor/uvicorn",
+            .lazy = true,
+        },
+        // zpip - our pip implementation in Zig with libxev, used to install Python packages
+        // into python_modules/ which is added to sys.path
+        // See src/tools/zpip.zig
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
