@@ -36,7 +36,15 @@ pub fn initModule(vm: *VM) anyerror!Obj {
     // modules
     try mset(vm, m, "modules", try rt.mkObj(rt.dict_t, .{ .dict = rt.modules }));
     // version
-    try mset(vm, m, "version", try rt.newStr("3.14.6 (zython, Zig 0.16.0)")); // change to dynamic Zig version
+    // sys.version — версия Python-совместимости + динамическая версия Zig
+    {
+        const ver = try std.fmt.allocPrint(rt.gpa, "3.14.6 (zython, Zig {d}.{d}.{d})", .{
+            builtin.zig_version.major,
+            builtin.zig_version.minor,
+            builtin.zig_version.patch,
+        });
+        try mset(vm, m, "version", try rt.newStr(ver));
+    }
     {
         const vi = try rt.newTuple(&.{
             try rt.newInt(3),
