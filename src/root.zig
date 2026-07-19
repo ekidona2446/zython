@@ -17,7 +17,7 @@ const std = @import("std");
 const Runtime = runtime_mod.Runtime;
 const VM = vm_mod.VM;
 
-pub const version_string = "3.13.0-zython-v2";
+pub const version_string = "3.14.6";
 
 pub const Interpreter = struct {
     rt: *Runtime,
@@ -34,6 +34,15 @@ pub const Interpreter = struct {
         const errno_mod = @import("stdlib/errno.zig");
         const os_mod = @import("stdlib/os.zig");
         const io_mod = @import("stdlib/io.zig");
+        const json_mod = @import("stdlib/json.zig");
+        const functools_mod = @import("stdlib/functools.zig");
+        const warnings_mod = @import("stdlib/warnings.zig");
+        const future_mod = @import("stdlib/__future__.zig");
+        const logging_mod = @import("stdlib/logging.zig");
+        const typing_mod = @import("stdlib/typing.zig");
+        const socket_mod = @import("stdlib/socket.zig");
+        const email_mod = @import("stdlib/email.zig");
+        const httpclient_mod = @import("stdlib/http_client.zig");
         import_mod.native_modules = &.{
             .{ .name = "sys", .init = sys_mod.initModule },
             .{ .name = "math", .init = math_mod.initModule },
@@ -41,6 +50,18 @@ pub const Interpreter = struct {
             .{ .name = "errno", .init = errno_mod.initModule },
             .{ .name = "os", .init = os_mod.initModule },
             .{ .name = "io", .init = io_mod.initModule },
+            .{ .name = "json", .init = json_mod.initModule },
+            .{ .name = "functools", .init = functools_mod.initModule },
+            .{ .name = "warnings", .init = warnings_mod.initModule },
+            .{ .name = "__future__", .init = future_mod.initModule },
+            .{ .name = "logging", .init = logging_mod.initModule },
+            .{ .name = "typing", .init = typing_mod.initModule },
+            .{ .name = "socket", .init = socket_mod.initModule },
+            .{ .name = "email", .init = email_mod.initModule },
+            .{ .name = "email.errors", .init = email_mod.initErrors },
+            .{ .name = "email.utils", .init = email_mod.initUtils },
+            .{ .name = "http", .init = httpclient_mod.initPackage },
+            .{ .name = "http.client", .init = httpclient_mod.initModule },
         };
         // lib-директория (vendored stdlib): <dir-of-exe>/lib/python3.14
         rt.lib_dir = findLibDir(rt) catch null;

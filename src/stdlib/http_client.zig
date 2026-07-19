@@ -1,428 +1,387 @@
-//! http.client — HTTP protocol client
-//! Аналог Lib/http/client.py
-//! Critical для requests, httpx, aiohttp
+//! http.client — аналог Lib/http/client.py (рабочее подмножество для urllib3/requests).
+//! HTTPConnection на реальном socket, HTTPResponse, HTTPSConnection (через ssl при наличии).
 
 const std = @import("std");
 const object = @import("../object/object.zig");
-const Allocator = std.mem.Allocator;
+const ops = @import("../vm/ops.zig");
+const vm_mod = @import("../vm/vm.zig");
+const compiler = @import("../compiler/compiler.zig");
 
-// === HTTP status codes ===
-pub const HTTPStatus = enum(i32) {
-    // 1xx Informational
-    CONTINUE = 100,
-    SWITCHING_PROTOCOLS = 101,
-    PROCESSING = 102,
-    EARLY_HINTS = 103,
+const VM = vm_mod.VM;
+const Obj = object.Obj;
 
-    // 2xx Success
-    OK = 200,
-    CREATED = 201,
-    ACCEPTED = 202,
-    NON_AUTHORITATIVE_INFORMATION = 203,
-    NO_CONTENT = 204,
-    RESET_CONTENT = 205,
-    PARTIAL_CONTENT = 206,
-    MULTI_STATUS = 207,
-    ALREADY_REPORTED = 208,
-    IM_USED = 226,
+const PY_SRC =
+    \\import socket as _socket
+    \\
+    \\# --- Исключения (аналог http.client) ---
+    \\class HTTPException(Exception): pass
+    \\class NotConnected(HTTPException): pass
+    \\class InvalidURL(HTTPException): pass
+    \\class UnknownProtocol(HTTPException):
+    \\    def __init__(self, version): self.version = version
+    \\class UnknownTransferEncoding(HTTPException): pass
+    \\class UnimplementedFileMode(HTTPException): pass
+    \\class IncompleteRead(HTTPException):
+    \\    def __init__(self, partial, expected=None):
+    \\        self.partial = partial
+    \\        self.expected = expected
+    \\        super().__init__(repr(partial), expected)
+    \\class ImproperConnectionState(HTTPException): pass
+    \\class CannotSendRequest(ImproperConnectionState): pass
+    \\class CannotSendHeader(ImproperConnectionState): pass
+    \\class ResponseNotReady(ImproperConnectionState): pass
+    \\class BadStatusLine(HTTPException):
+    \\    def __init__(self, line): self.line = line; super().__init__(line)
+    \\class LineTooLong(HTTPException):
+    \\    def __init__(self, line_type): super().__init__('got more than %d bytes when reading %s' % (65536, line_type))
+    \\class RemoteDisconnected(ConnectionResetError, BadStatusLine):
+    \\    def __init__(self, *a, **k):
+    \\        BadStatusLine.__init__(self, '')
+    \\        ConnectionResetError.__init__(self, *a)
+    \\
+    \\responses = {
+    \\    100: 'Continue', 101: 'Switching Protocols',
+    \\    200: 'OK', 201: 'Created', 202: 'Accepted', 203: 'Non-Authoritative Information',
+    \\    204: 'No Content', 205: 'Reset Content', 206: 'Partial Content',
+    \\    300: 'Multiple Choices', 301: 'Moved Permanently', 302: 'Found', 303: 'See Other',
+    \\    304: 'Not Modified', 305: 'Use Proxy', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
+    \\    400: 'Bad Request', 401: 'Unauthorized', 402: 'Payment Required', 403: 'Forbidden',
+    \\    404: 'Not Found', 405: 'Method Not Allowed', 406: 'Not Acceptable',
+    \\    407: 'Proxy Authentication Required', 408: 'Request Timeout', 409: 'Conflict',
+    \\    410: 'Gone', 411: 'Length Required', 412: 'Precondition Failed',
+    \\    413: 'Request Entity Too Large', 414: 'Request-URI Too Long',
+    \\    415: 'Unsupported Media Type', 416: 'Requested Range Not Satisfiable',
+    \\    417: 'Expectation Failed', 429: 'Too Many Requests',
+    \\    500: 'Internal Server Error', 501: 'Not Implemented', 502: 'Bad Gateway',
+    \\    503: 'Service Unavailable', 504: 'Gateway Timeout', 505: 'HTTP Version Not Supported',
+    \\}
+    \\
+    \\_CONTINUE = 100
+    \\HTTP_PORT = 80
+    \\HTTPS_PORT = 443
+    \\_CS_IDLE = 'Idle'
+    \\_CS_REQ_STARTED = 'Request-started'
+    \\_CS_REQ_SENT = 'Request-sent'
+    \\
+    \\class HTTPResponse:
+    \\    def __init__(self, sock, method='GET'):
+    \\        self._sock = sock
+    \\        self.method = method
+    \\        self.version = 11
+    \\        self.status = None
+    \\        self.code = None
+    \\        self.reason = None
+    \\        self.headers = _Headers()
+    \\        self.msg = None
+    \\        self._body = b''
+    \\        self._read_done = False
+    \\        self.will_close = True
+    \\        self.chunked = False
+    \\        self.length = None
+    \\        self.closed = False
+    \\    def _parse_status(self, line):
+    \\        parts = line.split(None, 2)
+    \\        self.version = 11 if '1.1' in parts[0] else 10
+    \\        self.status = int(parts[1])
+    \\        self.code = self.status
+    \\        self.reason = parts[2] if len(parts) > 2 else ''
+    \\    def begin(self):
+    \\        line = self._readline()
+    \\        if not line:
+    \\            raise RemoteDisconnected('Remote end closed connection without response')
+    \\        if not line.startswith('HTTP/'):
+    \\            raise BadStatusLine(line)
+    \\        self._parse_status(line)
+    \\        self.headers = _Headers()
+    \\        while True:
+    \\            h = self._readline()
+    \\            if h in ('', '\r'):
+    \\                break
+    \\            h = h.rstrip('\r\n')
+    \\            if ':' in h:
+    \\                k, v = h.split(':', 1)
+    \\                self.headers.add(k.strip(), v.strip())
+    \\        te = self.headers.get('Transfer-Encoding', '').lower()
+    \\        cl = self.headers.get('Content-Length')
+    \\        if te == 'chunked':
+    \\            self.chunked = True
+    \\        elif cl is not None:
+    \\            try: self.length = int(cl)
+    \\            except Exception: self.length = None
+    \\        self.msg = self.headers
+    \\    def _readline(self):
+    \\        buf = b''
+    \\        while not buf.endswith(b'\n'):
+    \\            c = self._sock.recv(1)
+    \\            if not c:
+    \\                break
+    \\            buf += c
+    \\            if len(buf) > 65536:
+    \\                raise LineTooLong('header')
+    \\        return buf.decode('iso-8859-1')
+    \\    def _read_exact(self, n):
+    \\        data = b''
+    \\        while len(data) < n:
+    \\            c = self._sock.recv(n - len(data))
+    \\            if not c:
+    \\                break
+    \\            data += c
+    \\        return data
+    \\    def read(self, amt=None):
+    \\        if self._read_done and amt is None:
+    \\            return self._body
+    \\        data = b''
+    \\        if self.chunked:
+    \\            data = self._read_chunked()
+    \\        elif self.length is not None:
+    \\            data = self._read_exact(self.length)
+    \\            self.length = 0
+    \\        else:
+    \\            while True:
+    \\                c = self._sock.recv(8192)
+    \\                if not c:
+    \\                    break
+    \\                data += c
+    \\        if self._body == b'':
+    \\            self._body = data
+    \\        self._read_done = True
+    \\        if amt is not None:
+    \\            return data[:amt]
+    \\        return data
+    \\    def _read_chunked(self):
+    \\        data = b''
+    \\        while True:
+    \\            line = self._readline().strip()
+    \\            if not line:
+    \\                continue
+    \\            size = int(line.split(b';')[0], 16)
+    \\            if size == 0:
+    \\                self._readline()
+    \\                break
+    \\            data += self._read_exact(size)
+    \\            self._readline()
+    \\        return data
+    \\    def readinto(self, b):
+    \\        data = self.read(len(b))
+    \\        n = len(data)
+    \\        b[:n] = data
+    \\        return n
+    \\    def isclosed(self):
+    \\        return self._read_done
+    \\    def close(self):
+    \\        self.closed = True
+    \\    def getheader(self, name, default=None):
+    \\        return self.headers.get(name, default)
+    \\    def getheaders(self):
+    \\        return list(self.headers.items())
+    \\    def info(self):
+    \\        return self.headers
+    \\    def fp(self):
+    \\        return None
+    \\    def readable(self):
+    \\        return True
+    \\    def peek(self, n=1):
+    \\        return b''
+    \\
+    \\class _Headers:
+    \\    def __init__(self):
+    \\        self._items = []
+    \\    def add(self, k, v):
+    \\        self._items.append((k, v))
+    \\    def get(self, name, default=None):
+    \\        name = name.lower()
+    \\        for k, v in self._items:
+    \\            if k.lower() == name:
+    \\                return v
+    \\        return default
+    \\    def get_all(self, name, default=None):
+    \\        name = name.lower()
+    \\        r = [v for k, v in self._items if k.lower() == name]
+    \\        return r if r else default
+    \\    def items(self):
+    \\        return list(self._items)
+    \\    def keys(self):
+    \\        return [k for k, v in self._items]
+    \\    def values(self):
+    \\        return [v for k, v in self._items]
+    \\    def __getitem__(self, name):
+    \\        v = self.get(name)
+    \\        if v is None:
+    \\            raise KeyError(name)
+    \\        return v
+    \\    def __contains__(self, name):
+    \\        return self.get(name) is not None
+    \\    def __iter__(self):
+    \\        return iter(self.keys())
+    \\    def __len__(self):
+    \\        return len(self._items)
+    \\    def __repr__(self):
+    \\        return '<_Headers %r>' % (self._items,)
+    \\    def as_bytes(self):
+    \\        return (''.join('%s: %s\r\n' % (k, v) for k, v in self._items)).encode('iso-8859-1')
+    \\
+    \\class HTTPConnection:
+    \\    default_port = HTTP_PORT
+    \\    auto_open = 1
+    \\    debuglevel = 0
+    \\    _http_vsn = 11
+    \\    _http_vsn_str = 'HTTP/1.1'
+    \\    response_class = HTTPResponse
+    \\    protocol_version = 'HTTP/1.0'
+    \\
+    \\    def __init__(self, host, port=None, timeout=None, source_address=None, blocksize=8192):
+    \\        self.host = host
+    \\        self.port = port if port is not None else self.default_port
+    \\        self.timeout = timeout
+    \\        self.source_address = source_address
+    \\        self.blocksize = blocksize
+    \\        self.sock = None
+    \\        self._buffer = []
+    \\        self.__response = None
+    \\        self.__state = _CS_IDLE
+    \\        self._method = None
+    \\        self._tunnel_host = None
+    \\
+    \\    def _new_conn(self):
+    \\        sock = _socket.create_connection((self.host, self.port), self.timeout)
+    \\        return sock
+    \\
+    \\    def connect(self):
+    \\        self.sock = self._new_conn()
+    \\        self.__state = _CS_IDLE
+    \\
+    \\    def set_debuglevel(self, level):
+    \\        self.debuglevel = level
+    \\
+    \\    def set_tunnel(self, host, port=None, headers=None):
+    \\        self._tunnel_host = host
+    \\        self._tunnel_port = port
+    \\        self._tunnel_headers = headers or {}
+    \\
+    \\    def send(self, data):
+    \\        if self.sock is None:
+    \\            if self.auto_open:
+    \\                self.connect()
+    \\            else:
+    \\                raise NotConnected()
+    \\        if hasattr(data, 'read'):
+    \\            while True:
+    \\                d = data.read(self.blocksize)
+    \\                if not d:
+    \\                    break
+    \\                self.sock.sendall(d)
+    \\        else:
+    \\            if isinstance(data, str):
+    \\                data = data.encode('iso-8859-1')
+    \\            self.sock.sendall(data)
+    \\
+    \\    def putrequest(self, method, url, skip_host=False, skip_accept_encoding=False):
+    \\        if self.sock is None:
+    \\            self.connect()
+    \\        self._method = method
+    \\        self._buffer = []
+    \\        request = '%s %s %s' % (method, url, self._http_vsn_str)
+    \\        self._buffer.append((request + '\r\n').encode('iso-8859-1'))
+    \\        if self.protocol_version == 'HTTP/1.1' and not skip_host:
+    \\            netloc = self.host
+    \\            if self.port and self.port != self.default_port:
+    \\                netloc = '%s:%s' % (self.host, self.port)
+    \\            self._buffer.append(('Host: %s\r\n' % netloc).encode('iso-8859-1'))
+    \\        self.__state = _CS_REQ_STARTED
+    \\
+    \\    def putheader(self, header, *values):
+    \\        v = '\r\n\t'.join(str(x) for x in values)
+    \\        self._buffer.append(('%s: %s\r\n' % (header, v)).encode('iso-8859-1'))
+    \\
+    \\    def endheaders(self, message_body=None, encode_chunked=False):
+    \\        if self.__state != _CS_REQ_STARTED:
+    \\            raise CannotSendHeader()
+    \\        self._buffer.append(b'\r\n')
+    \\        msg = b''.join(self._buffer)
+    \\        self._buffer = []
+    \\        self.send(msg)
+    \\        if message_body is not None:
+    \\            self.send(message_body)
+    \\        self.__state = _CS_REQ_SENT
+    \\
+    \\    def request(self, method, url, body=None, headers=None, encode_chunked=False):
+    \\        headers = headers or {}
+    \\        self.putrequest(method, url)
+    \\        if body is not None:
+    \\            if isinstance(body, str):
+    \\                body = body.encode('iso-8859-1')
+    \\            if 'Content-Length' not in headers and 'Transfer-Encoding' not in headers:
+    \\                headers['Content-Length'] = str(len(body))
+    \\        for k, v in headers.items():
+    \\            self.putheader(k, v)
+    \\        self.endheaders(body)
+    \\
+    \\    def getresponse(self):
+    \\        if self.sock is None:
+    \\            raise ResponseNotReady()
+    \\        resp = self.response_class(self.sock, self._method or 'GET')
+    \\        resp.begin()
+    \\        self.__response = resp
+    \\        self.__state = _CS_IDLE
+    \\        if resp.will_close:
+    \\            self.sock = None
+    \\        return resp
+    \\
+    \\    def close(self):
+    \\        if self.sock is not None:
+    \\            self.sock.close()
+    \\            self.sock = None
+    \\        self.__state = _CS_IDLE
+    \\
+    \\    def __enter__(self):
+    \\        return self
+    \\    def __exit__(self, *a):
+    \\        self.close()
+    \\        return False
+    \\
+    \\class HTTPSConnection(HTTPConnection):
+    \\    default_port = HTTPS_PORT
+    \\    def __init__(self, host, port=None, key_file=None, cert_file=None,
+    \\                 timeout=None, source_address=None, context=None,
+    \\                 check_hostname=None, blocksize=8192, **kw):
+    \\        super().__init__(host, port, timeout, source_address, blocksize)
+    \\        self.key_file = key_file
+    \\        self.cert_file = cert_file
+    \\        self._context = context
+    \\        self._check_hostname = check_hostname
+    \\    def connect(self):
+    \\        sock = self._new_conn()
+    \\        try:
+    \\            import ssl
+    \\            ctx = self._context or ssl.create_default_context()
+    \\            self.sock = ctx.wrap_socket(sock, server_hostname=self.host)
+    \\        except ImportError:
+    \\            self.sock = sock
+    \\
+    \\class HTTP:
+    \\    def __init__(self, host='', port=None, **kw):
+    \\        self._conn = HTTPConnection(host, port)
+    \\class HTTPS:
+    \\    def __init__(self, host='', port=None, **kw):
+    \\        self._conn = HTTPSConnection(host, port)
+;
 
-    // 3xx Redirection
-    MULTIPLE_CHOICES = 300,
-    MOVED_PERMANENTLY = 301,
-    FOUND = 302,
-    SEE_OTHER = 303,
-    NOT_MODIFIED = 304,
-    USE_PROXY = 305,
-    TEMPORARY_REDIRECT = 307,
-    PERMANENT_REDIRECT = 308,
+pub fn initPackage(vm: *VM) anyerror!Obj {
+    const m = try vm.rt.newModuleObj("http");
+    const path = try vm.rt.newList();
+    try path.v.list.items.append(vm.rt.gpa, try vm.rt.newStr("<http>"));
+    try ops.dictSetStr(m.v.module.dict, vm, "__path__", path);
+    try ops.dictSetStr(m.v.module.dict, vm, "__builtins__", try vm.rt.mkObj(vm.rt.dict_t, .{ .dict = vm.rt.builtins_dict }));
+    return m;
+}
 
-    // 4xx Client Errors
-    BAD_REQUEST = 400,
-    UNAUTHORIZED = 401,
-    PAYMENT_REQUIRED = 402,
-    FORBIDDEN = 403,
-    NOT_FOUND = 404,
-    METHOD_NOT_ALLOWED = 405,
-    NOT_ACCEPTABLE = 406,
-    PROXY_AUTHENTICATION_REQUIRED = 407,
-    REQUEST_TIMEOUT = 408,
-    CONFLICT = 409,
-    GONE = 410,
-    LENGTH_REQUIRED = 411,
-    PRECONDITION_FAILED = 412,
-    REQUEST_ENTITY_TOO_LARGE = 413,
-    REQUEST_URI_TOO_LONG = 414,
-    UNSUPPORTED_MEDIA_TYPE = 415,
-    RANGE_NOT_SATISFIABLE = 416,
-    EXPECTATION_FAILED = 417,
-    IM_A_TEAPOT = 418,
-    MISDIRECTED_REQUEST = 421,
-    UNPROCESSABLE_ENTITY = 422,
-    LOCKED = 423,
-    FAILED_DEPENDENCY = 424,
-    UPGRADE_REQUIRED = 426,
-    PRECONDITION_REQUIRED = 428,
-    TOO_MANY_REQUESTS = 429,
-
-    // 5xx Server Errors
-    INTERNAL_SERVER_ERROR = 500,
-    NOT_IMPLEMENTED = 501,
-    BAD_GATEWAY = 502,
-    SERVICE_UNAVAILABLE = 503,
-    GATEWAY_TIMEOUT = 504,
-    HTTP_VERSION_NOT_SUPPORTED = 505,
-    VARIANT_ALSO_NEGOTIATES = 506,
-    INSUFFICIENT_STORAGE = 507,
-    LOOP_DETECTED = 508,
-    NOT_EXTENDED = 510,
-    NETWORK_AUTHENTICATION_REQUIRED = 511,
-};
-
-pub const HTTP_VERSION = "HTTP/1.1";
-
-/// HTTP response class
-pub const HTTPResponse = struct {
-    _version: []const u8,
-    _status: i32,
-    _reason: []const u8,
-    _headers: std.StringHashMap([]const u8),
-    _body: []u8,
-    _closed: bool,
-
-    pub fn init(allocator: Allocator) !*HTTPResponse {
-        const self = try allocator.create(HTTPResponse);
-        self.* = .{
-            ._version = HTTP_VERSION,
-            ._status = 200,
-            ._reason = "OK",
-            ._headers = std.StringHashMap([]const u8).init(allocator),
-            ._body = &.{},
-            ._closed = false,
-        };
-        return self;
-    }
-
-    pub fn getStatus(self: *const HTTPResponse) i32 {
-        return self._status;
-    }
-
-    pub fn getReason(self: *const HTTPResponse) []const u8 {
-        return self._reason;
-    }
-
-    pub fn read(self: *HTTPResponse, allocator: Allocator, size: ?usize) ![]u8 {
-        if (self._closed) return error.BadStatusLine;
-        if (size) |n| {
-            return self._body[0..@min(n, self._body.len)];
-        }
-        return self._body;
-    }
-
-    pub fn getheader(self: *const HTTPResponse, name: []const u8) ?[]const u8 {
-        return self._headers.get(name);
-    }
-
-    pub fn getheaders(self: *const HTTPResponse) []const u8 {
-        _ = self;
-        return "";
-    }
-
-    pub fn close(self: *HTTPResponse) void {
-        self._closed = true;
-    }
-};
-
-/// HTTP request class
-pub const HTTPRequest = struct {
-    _method: []const u8,
-    _url: []const u8,
-    _headers: std.StringHashMap([]const u8),
-    _host: []const u8,
-    _port: u16,
-    _selector: []const u8,
-
-    pub fn init(allocator: Allocator, method: []const u8, url: []const u8, host: []const u8, port: u16) !*HTTPRequest {
-        const self = try allocator.create(HTTPRequest);
-        self.* = .{
-            ._method = method,
-            ._url = url,
-            ._headers = std.StringHashMap([]const u8).init(allocator),
-            ._host = host,
-            ._port = port,
-            ._selector = url,
-        };
-        return self;
-    }
-};
-
-/// HTTPConnection base class
-pub const HTTPConnection = struct {
-    _host: []const u8,
-    _port: u16,
-    _timeout: ?u32,
-    _source_address: ?[]const u8,
-    _blocksize: u32,
-    _response: ?*HTTPResponse,
-    _connection: ?object.ObjectPtr, // socket
-    _closed: bool,
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, host: []const u8, port: ?u16, timeout: ?u32) !*HTTPConnection {
-        const self = try allocator.create(HTTPConnection);
-        self.* = .{
-            ._host = host,
-            ._port = port orelse 80,
-            ._timeout = timeout,
-            ._source_address = null,
-            ._blocksize = 8192,
-            ._response = null,
-            ._connection = null,
-            ._closed = false,
-            .allocator = allocator,
-        };
-        return self;
-    }
-
-    pub fn request(self: *HTTPConnection, method: []const u8, selector: []const u8, body: ?[]const u8, headers: ?object.ObjectPtr) !*HTTPResponse {
-        std.debug.print("[http.client] {s} {s} -> {s}:{d}\n", .{
-            method, selector, self._host, self._port
-        });
-        
-        const response = try HTTPResponse.init(self.allocator);
-        response._status = 200;
-        response._reason = "OK";
-        
-        self._response = response;
-        return response;
-    }
-
-    pub fn getresponse(self: *HTTPConnection) !*HTTPResponse {
-        return self._response orelse error.ResponseNotReady;
-    }
-
-    pub fn close(self: *HTTPConnection) void {
-        self._closed = true;
-        if (self._connection) |conn| {
-            _ = conn;
-        }
-    }
-
-    pub fn connect(self: *HTTPConnection) !void {
-        std.debug.print("[http.client] Connecting to {s}:{d}\n", .{self._host, self._port});
-        // In real implementation, would create socket connection
-    }
-};
-
-/// HTTPSConnection
-pub const HTTPSConnection = struct {
-    parent: HTTPConnection,
-    _key_file: ?[]const u8,
-    _cert_file: ?[]const u8,
-    _context: ?object.ObjectPtr,
-
-    pub fn init(allocator: Allocator, host: []const u8, port: ?u16, timeout: ?u32) !*HTTPSConnection {
-        const self = try allocator.create(HTTPSConnection);
-        self.* = .{
-            .parent = (try HTTPConnection.init(allocator, host, port, timeout)).*,
-            ._key_file = null,
-            ._cert_file = null,
-            ._context = null,
-        };
-        return self;
-    }
-};
-
-/// HTTPConnectionPool (for connection reuse)
-pub const HTTPConnectionPool = struct {
-    _host: []const u8,
-    _port: u16,
-    _scheme: []const u8,
-
-    pub fn init(allocator: Allocator, host: []const u8, port: ?u16, scheme: []const u8) !*HTTPConnectionPool {
-        const self = try allocator.create(HTTPConnectionPool);
-        self.* = .{
-            ._host = host,
-            ._port = port orelse 80,
-            ._scheme = scheme,
-        };
-        return self;
-    }
-
-    pub fn urlopen(self: *HTTPConnectionPool, method: []const u8, url: []const u8) !*HTTPResponse {
-        _ = self;
-        _ = method;
-        _ = url;
-        return error.NotImplemented;
-    }
-};
-
-// === BadStatusLine exception ===
-pub const BadStatusLine = struct {
-    line: []const u8,
-
-    pub fn init(line: []const u8) BadStatusLine {
-        return .{ .line = line };
-    }
-};
-
-// === HTTP client module ===
-
-pub const HTTPClientModule = struct {
-    pub fn init(allocator: Allocator) !object.ObjectPtr {
-        var dict = std.StringHashMap(object.ObjectPtr).init(allocator);
-
-        // Connection classes
-        try dict.put("HTTPConnection", try createClass(allocator, "HTTPConnection"));
-        try dict.put("HTTPSConnection", try createClass(allocator, "HTTPSConnection"));
-        try dict.put("HTTPConnectionPool", try createClass(allocator, "HTTPConnectionPool"));
-        try dict.put("HTTPResponse", try createClass(allocator, "HTTPResponse"));
-        try dict.put("HTTPRequest", try createClass(allocator, "HTTPRequest"));
-
-        // Exceptions
-        try dict.put("HTTPException", try createClass(allocator, "HTTPException"));
-        try dict.put("BadStatusLine", try createClass(allocator, "BadStatusLine"));
-        try dict.put("RemoteDisconnected", try createClass(allocator, "RemoteDisconnected"));
-        try dict.put("NotConnected", try createClass(allocator, "NotConnected"));
-        try dict.put("InvalidURL", try createClass(allocator, "InvalidURL"));
-        try dict.put("CannotSendRequest", try createClass(allocator, "CannotSendRequest"));
-        try dict.put("CannotSendHeader", try createClass(allocator, "CannotSendHeader"));
-        try dict.put("ResponseNotReady", try createClass(allocator, "ResponseNotReady"));
-        try dict.put("LineTooLong", try createClass(allocator, "LineTooLong"));
-        try dict.put("ImproperConnectionState", try createClass(allocator, "ImproperConnectionState"));
-
-        // Constants
-        try dict.put("HTTP_PORT", try object.PyObject.newInt(allocator, 80));
-        try dict.put("HTTPS_PORT", try object.PyObject.newInt(allocator, 443));
-        try dict.put("CONTINUE", try object.PyObject.newInt(allocator, 100));
-        try dict.put("OK", try object.PyObject.newInt(allocator, 200));
-        try dict.put("CREATED", try object.PyObject.newInt(allocator, 201));
-        try dict.put("ACCEPTED", try object.PyObject.newInt(allocator, 202));
-        try dict.put("MOVED_PERMANENTLY", try object.PyObject.newInt(allocator, 301));
-        try dict.put("FOUND", try object.PyObject.newInt(allocator, 302));
-        try dict.put("NOT_MODIFIED", try object.PyObject.newInt(allocator, 304));
-        try dict.put("BAD_REQUEST", try object.PyObject.newInt(allocator, 400));
-        try dict.put("UNAUTHORIZED", try object.PyObject.newInt(allocator, 401));
-        try dict.put("FORBIDDEN", try object.PyObject.newInt(allocator, 403));
-        try dict.put("NOT_FOUND", try object.PyObject.newInt(allocator, 404));
-        try dict.put("INTERNAL_SERVER_ERROR", try object.PyObject.newInt(allocator, 500));
-        try dict.put("NOT_IMPLEMENTED", try object.PyObject.newInt(allocator, 501));
-        try dict.put("BAD_GATEWAY", try object.PyObject.newInt(allocator, 502));
-        try dict.put("SERVICE_UNAVAILABLE", try object.PyObject.newInt(allocator, 503));
-
-        const module_val = object.ModuleValue{
-            .name = "http.client",
-            .dict = dict,
-            .file = "http.client (Zig)",
-        };
-
-        return try object.PyObject.create(allocator, &object.ModuleType, .{ .Module = module_val });
-    }
-
-    fn createClass(allocator: Allocator, name: []const u8) !object.ObjectPtr {
-        var class_dict = std.StringHashMap(object.ObjectPtr).init(allocator);
-        
-        // Add common methods for connection classes
-        if (std.mem.eql(u8, name, "HTTPConnection") or std.mem.eql(u8, name, "HTTPSConnection")) {
-            try class_dict.put("request", try createBuiltin(allocator, "request", connRequest));
-            try class_dict.put("getresponse", try createBuiltin(allocator, "getresponse", connGetResponse));
-            try class_dict.put("close", try createBuiltin(allocator, "close", connClose));
-            try class_dict.put("connect", try createBuiltin(allocator, "connect", connConnect));
-            try class_dict.put("set_tunnel", try createBuiltin(allocator, "set_tunnel", connSetTunnel));
-            try class_dict.put("putrequest", try createBuiltin(allocator, "putrequest", connPutRequest));
-            try class_dict.put("putheader", try createBuiltin(allocator, "putheader", connPutHeader));
-            try class_dict.put("endheaders", try createBuiltin(allocator, "endheaders", connEndHeaders));
-            try class_dict.put("send", try createBuiltin(allocator, "send", connSend));
-        }
-        
-        // Add common methods for response
-        if (std.mem.eql(u8, name, "HTTPResponse")) {
-            try class_dict.put("read", try createBuiltin(allocator, "read", responseRead));
-            try class_dict.put("getheader", try createBuiltin(allocator, "getheader", responseGetHeader));
-            try class_dict.put("getheaders", try createBuiltin(allocator, "getheaders", responseGetHeaders));
-            try class_dict.put("close", try createBuiltin(allocator, "close", responseClose));
-            try class_dict.put("readable", try createBuiltin(allocator, "readable", responseReadable));
-        }
-
-        const class_val = object.ModuleValue{ .name = name, .dict = class_dict, .file = null };
-        return try object.PyObject.create(allocator, &object.ModuleType, .{ .Module = class_val });
-    }
-
-    fn createBuiltin(allocator: Allocator, name: []const u8, func: object.BuiltinFn) !object.ObjectPtr {
-        _ = name;
-        return try object.PyObject.create(allocator, &object.FunctionType, .{ .BuiltinFunction = func });
-    }
-
-    // Connection methods
-    fn connRequest(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        std.debug.print("[http.client] HTTPConnection.request()\n", .{});
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn connGetResponse(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try createClass(allocator, "HTTPResponse");
-    }
-
-    fn connClose(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn connConnect(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        std.debug.print("[http.client] Connecting...\n", .{});
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn connSetTunnel(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn connPutRequest(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn connPutHeader(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn connEndHeaders(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn connSend(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    // Response methods
-    fn responseRead(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newBytes(allocator, &[_]u8{});
-    }
-
-    fn responseGetHeader(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn responseGetHeaders(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn responseClose(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newNone(allocator);
-    }
-
-    fn responseReadable(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
-        _ = args;
-        return try object.PyObject.newBool(allocator, true);
-    }
-};
+pub fn initModule(vm: *VM) anyerror!Obj {
+    const rt = vm.rt;
+    const m = try rt.newModuleObj("http.client");
+    const md = m.v.module;
+    try ops.dictSetStr(md.dict, vm, "__name__", try rt.newStr("http.client"));
+    try ops.dictSetStr(md.dict, vm, "__builtins__", try rt.mkObj(rt.dict_t, .{ .dict = rt.builtins_dict }));
+    const code = compiler.compileSource(vm, "<http.client>", PY_SRC, .exec) catch |e| return e;
+    vm.runNameScope(code, md.dict, null) catch |e| return e;
+    return m;
+}

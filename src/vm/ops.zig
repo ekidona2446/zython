@@ -40,7 +40,7 @@ fn isDataDescriptor(attr: Obj) bool {
 }
 
 /// Применить __get__ дескриптора. Если не дескриптор — вернуть как есть.
-fn descrGet(vm: *VM, attr: Obj, obj: ?Obj, ty: *Type) anyerror!Obj {
+pub fn descrGet(vm: *VM, attr: Obj, obj: ?Obj, ty: *Type) anyerror!Obj {
     switch (attr.v) {
         .function => {
             if (obj) |o| return vm.rt.newMethod(o, attr);
@@ -102,6 +102,13 @@ fn descrSet(vm: *VM, attr: Obj, obj: Obj, value: Obj) anyerror!bool {
 // ============================================================
 
 pub fn pyGetAttr(vm: *VM, obj: Obj, name: []const u8) anyerror!Obj {
+    // staticmethod/classmethod: __func__ / __wrapped__ → обёрнутый callable
+    if (obj.v == .staticm) {
+        if (std.mem.eql(u8, name, "__func__") or std.mem.eql(u8, name, "__wrapped__")) return obj.v.staticm.callable;
+    }
+    if (obj.v == .classm) {
+        if (std.mem.eql(u8, name, "__func__") or std.mem.eql(u8, name, "__wrapped__")) return obj.v.classm.callable;
+    }
     // Модули: сначала их dict (PEP 562 __getattr__).
     if (obj.v == .module) {
         const m = obj.v.module;
@@ -117,6 +124,22 @@ pub fn pyGetAttr(vm: *VM, obj: Obj, name: []const u8) anyerror!Obj {
     // Класс (тип как значение): ищем сначала в его MRO, потом в метаклассе.
     if (obj.v == .type_) {
         const cls = obj.v.type_;
+        // встроенные атрибуты типа (важны для enum/inspect: __name__, __dict__, __bases__, __mro__)
+        if (std.mem.eql(u8, name, "__name__")) return try vm.rt.newStr(cls.name);
+        if (std.mem.eql(u8, name, "__qualname__")) return try vm.rt.newStr(cls.qualname);
+        if (std.mem.eql(u8, name, "__module__")) return try vm.rt.newStr(cls.module orelse "builtins");
+        if (std.mem.eql(u8, name, "__dict__")) return try vm.rt.mkObj(vm.rt.dict_t, .{ .dict = cls.dict });
+        if (std.mem.eql(u8, name, "__bases__")) {
+            var bl: std.ArrayList(Obj) = .empty;
+            // obёртка класса несёт его настоящий метакласс (bt.ty), иначе isinstance сломается
+            for (cls.bases) |bt| try bl.append(vm.rt.gpa, try vm.rt.mkObj(bt.ty, .{ .type_ = bt }));
+            return vm.rt.newTupleOwned(bl.items);
+        }
+        if (std.mem.eql(u8, name, "__mro__")) {
+            var ml: std.ArrayList(Obj) = .empty;
+            for (cls.mro) |mt| try ml.append(vm.rt.gpa, try vm.rt.mkObj(mt.ty, .{ .type_ = mt }));
+            return vm.rt.newTupleOwned(ml.items);
+        }
         if (lookupClass(cls, name)) |attr| {
             return descrGet(vm, attr, null, cls);
         }
@@ -138,14 +161,22 @@ pub fn pyGetAttr(vm: *VM, obj: Obj, name: []const u8) anyerror!Obj {
         if (s.obj_type != null and s.obj != null) {
             const ot = s.obj_type.?;
             var start: usize = 0;
+            var found_anchor = false;
             for (ot.mro, 0..) |t, i| {
                 if (t == s.ty) {
                     start = i + 1;
+                    found_anchor = true;
                     break;
                 }
             }
-            if (start > 0) {
-                for (ot.mro[start..]) |t| {
+            // если якорь не в MRO (напр. zero-arg super в методе метакласса) — ищем с начала
+            if (!found_anchor) start = 0;
+            // два прохода: сначала после якоря, затем (fallback) весь MRO — нужно для
+            // super().__new__ в метаклассах, где type.__new__ лежит в самом якоре.
+            var pass: usize = 0;
+            while (pass < 2) : (pass += 1) {
+                const range_start: usize = if (pass == 0) start else 0;
+                for (ot.mro[range_start..]) |t| {
                     var it = t.dict.iterAlive();
                     while (it.next()) |e| {
                         if (e.key.?.v == .str and std.mem.eql(u8, e.key.?.v.str.bytes, name)) {
@@ -153,9 +184,61 @@ pub fn pyGetAttr(vm: *VM, obj: Obj, name: []const u8) anyerror!Obj {
                         }
                     }
                 }
+                if (range_start == 0) break; // второй проход уже был полным
             }
         }
         try vm.raiseFmt("AttributeError", "'super' object has no attribute '{s}'", .{name});
+        return error.PyExc;
+    }
+
+    // функции: __dict__ (ленивый) и произвольные атрибуты
+    if (obj.v == .function) {
+        const f = obj.v.function;
+        if (std.mem.eql(u8, name, "__dict__")) {
+            if (f.dict == null) f.dict = try vm.rt.newDict();
+            return try vm.rt.mkObj(vm.rt.dict_t, .{ .dict = f.dict.? });
+        }
+        // переопределения через setattr (в т.ч. functools.wraps) имеют приоритет
+        if (f.dict) |d| {
+            if (try dictGetStr(d, vm, name)) |v| return v;
+        }
+        if (std.mem.eql(u8, name, "__name__")) return try vm.rt.newStr(f.name);
+        if (std.mem.eql(u8, name, "__qualname__")) return try vm.rt.newStr(f.qualname);
+        if (std.mem.eql(u8, name, "__doc__")) {
+            if (f.code.consts.len > 0 and f.code.consts[0].v == .str) return f.code.consts[0];
+            return vm.rt.newNone();
+        }
+        if (std.mem.eql(u8, name, "__module__")) {
+            if (try dictGetStr(f.globals, vm, "__name__")) |mn| return mn;
+            return vm.rt.newNone();
+        }
+        if (std.mem.eql(u8, name, "__code__")) {
+            return vm.rt.mkObj(vm.rt.code_t, .{ .code = f.code });
+        }
+        if (std.mem.eql(u8, name, "__globals__")) {
+            return vm.rt.mkObj(vm.rt.dict_t, .{ .dict = f.globals });
+        }
+        if (std.mem.eql(u8, name, "__defaults__")) {
+            if (f.defaults.len == 0) return vm.rt.newNone();
+            return vm.rt.newTuple(f.defaults);
+        }
+        if (std.mem.eql(u8, name, "__kwdefaults__")) {
+            if (f.kwdefaults) |d| return vm.rt.mkObj(vm.rt.dict_t, .{ .dict = d });
+            return vm.rt.newNone();
+        }
+        if (std.mem.eql(u8, name, "__closure__")) {
+            if (f.closure.len == 0) return vm.rt.newNone();
+            var cells: std.ArrayList(Obj) = .empty;
+            for (f.closure) |cl| {
+                try cells.append(vm.rt.gpa, try vm.rt.mkObj(vm.rt.cell_t, .{ .cell = cl }));
+            }
+            return vm.rt.newTupleOwned(cells.items);
+        }
+        if (std.mem.eql(u8, name, "__annotations__")) {
+            if (f.annotations) |a| return a.*;
+            return vm.rt.newDictObj();
+        }
+        try vm.raiseFmt("AttributeError", "'function' object has no attribute '{s}'", .{name});
         return error.PyExc;
     }
 
@@ -190,6 +273,7 @@ pub fn instanceDict(obj: Obj) ?*Dict {
     return switch (obj.v) {
         .instance => |i| &i.dict,
         .exc => |e| &e.dict,
+        .function => |f| f.dict,
         else => null,
     };
 }
@@ -240,6 +324,13 @@ pub fn pySetAttr(vm: *VM, obj: Obj, name: []const u8, value: Obj) anyerror!void 
         try dictSetStr(obj.v.module.dict, vm, name, value);
         return;
     }
+    // функции: ленивый __dict__ для произвольных атрибутов
+    if (obj.v == .function) {
+        const f = obj.v.function;
+        if (f.dict == null) f.dict = try vm.rt.newDict();
+        try dictSetStr(f.dict.?, vm, name, value);
+        return;
+    }
     const ty = obj.ty;
     // data descriptor
     if (obj.v != .type_) {
@@ -263,6 +354,9 @@ pub fn pySetAttr(vm: *VM, obj: Obj, name: []const u8, value: Obj) anyerror!void 
 pub fn pyDelAttr(vm: *VM, obj: Obj, name: []const u8) anyerror!void {
     if (obj.v == .module) {
         if (try dictDelStr(obj.v.module.dict, vm, name)) return;
+    } else if (obj.v == .type_) {
+        // delattr на классе — удаление из dict класса
+        if (try dictDelStr(obj.v.type_.dict, vm, name)) return;
     } else if (instanceDict(obj)) |d| {
         if (try dictDelStr(d, vm, name)) return;
     }
@@ -305,7 +399,7 @@ pub fn pyCall(vm: *VM, callable: Obj, args: []const Obj, kw: ?KwArgs) anyerror!O
             return pyCall(vm, m.func, with_self, kw);
         },
         .function => |f| {
-            if (f.code.flags.generator) {
+            if (f.code.flags.generator or f.code.flags.coroutine) {
                 const frame = try vm.makeFrame(f, args, kw);
                 return vm.rt.newGenerator(frame);
             }
@@ -509,7 +603,11 @@ pub fn nativeTypeNew(vm: *VM, cls: *Type, args: []const Obj, kw: ?KwArgs) anyerr
             }
             s.obj = fr.locals[0];
             s.obj_type = fr.locals[0].ty;
-            if (s.ty == null) s.ty = fr.locals[0].ty;
+            if (s.ty == null) {
+                // для метода метакласса self — класс; якорь = сам класс (не type(self)),
+                // чтобы super().__new__ нашёл type.__new__, а не object.__new__.
+                s.ty = if (fr.locals[0].v == .type_) fr.locals[0].v.type_ else fr.locals[0].ty;
+            }
         }
         return rt.mkObj(rt.super_t, .{ .super_ = s });
     }
@@ -624,6 +722,13 @@ fn pyCallType(vm: *VM, cls: *Type, args: []const Obj, kw: ?KwArgs) anyerror!Obj 
         try vm.raiseStr("TypeError", "type() takes 1 or 3 arguments");
         return error.PyExc;
     }
+    // подкласс type (метакласс): Meta(name, bases, ns) → новый класс с метаклассом cls
+    if (cls.flags.is_type_obj) {
+        if (args.len == 1) return vm.typeOf(args[0]);
+        if (args.len == 3) return vm.buildClassFromCallMeta(cls, args, kw);
+        try vm.raiseStr("TypeError", "metaclass takes 1 or 3 arguments");
+        return error.PyExc;
+    }
     if (cls.tp_new) |newf| {
         return newf(vm, cls, args, kw);
     }
@@ -690,6 +795,8 @@ pub fn isInstance(vm: *VM, o: Obj, cls_or_tuple: Obj) anyerror!bool {
 
 pub fn pyEq(vm: *VM, a: Obj, b: Obj) anyerror!bool {
     if (a == b) return true;
+    // типы равны по Type-указателю (один класс = один Type, обёрток может быть много)
+    if (a.v == .type_ and b.v == .type_) return a.v.type_ == b.v.type_;
     // числа
     if (isNumber(a) and isNumber(b)) {
         return (try numericCompare(vm, .eq, a, b)) orelse false;
@@ -954,6 +1061,7 @@ pub fn pyHash(vm: *VM, o: Obj) anyerror!u64 {
         },
         .int => |i| return @bitCast(hashInt(i)),
         .bool_ => |b| return @bitCast(hashInt(@intFromBool(b))),
+        .type_ => |t| return @intFromPtr(t), // тип: hash по Type-указателю (обёрток может быть много)
         .bigint => |b| {
             const i = b.toInt(i64) catch {
                 // хеш большого — по строковому представлению (ok)

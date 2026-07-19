@@ -387,13 +387,53 @@ pub fn bi_build_class(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj 
     if (metaclass != v.rt.type_t) {
         // metaclass(name, bases, ns, **kw): выполнить тело, собрать ns и вызвать метакласс
         const ns = try execClassBody(v, func, name);
-        const nb = try basesToTypes(v, bases);
-        _ = nb;
         const base_tuple = try v.rt.newTuple(bases);
-        const ns_obj = try v.rt.mkObj(v.rt.dict_t, .{ .dict = ns });
         const name_s = try v.rt.newStr(name);
         const mc_obj = try v.rt.mkObj(v.rt.type_t, .{ .type_ = metaclass });
-        return v.pyCall(mc_obj, &.{ name_s, base_tuple, ns_obj }, kw);
+        var ns_obj: Obj = try v.rt.mkObj(v.rt.dict_t, .{ .dict = ns });
+        // __prepare__: метакласс может вернуть свой namespace (напр. enum._EnumDict).
+        // Копируем записи тела класса через его __setitem__ — так _EnumDict строит _member_names.
+        if (ops.lookupClass(metaclass, "__prepare__")) |prep| {
+            const bound = ops.descrGet(v, prep, mc_obj, metaclass) catch prep;
+            if (v.pyCall(bound, &.{ name_s, base_tuple }, null)) |prepared| {
+                var it = ns.iterAlive();
+                while (it.next()) |e| {
+                    v.pySetItem(prepared, e.key.?, e.val.?) catch {
+                        // fallback: прямая установка в data (если кастомный __setitem__ упал)
+                        switch (prepared.v) {
+                            .instance => |inst| {
+                                if (inst.data == null) {
+                                    inst.data = v.rt.newDict() catch null;
+                                }
+                                if (inst.data) |dd| {
+                                    const hh = v.pyHash(e.key.?) catch 0;
+                                    dd.setWithHash(v, e.key.?, e.val.?, hh) catch {};
+                                }
+                            },
+                            else => {},
+                        }
+                        v.currentTS().cur_exc = null;
+                    };
+                }
+                ns_obj = prepared;
+            } else |_| {
+                v.currentTS().cur_exc = null;
+            }
+        }
+        // CPython __build_class__ извлекает metaclass из kwargs — не передаём его в метакласс
+        var filtered_kw: ?KwArgs = null;
+        if (kw) |k| {
+            var fnames: std.ArrayList([]const u8) = .empty;
+            var fvals: std.ArrayList(Obj) = .empty;
+            for (k.names, 0..) |n, i| {
+                if (!std.mem.eql(u8, n, "metaclass")) {
+                    try fnames.append(v.rt.gpa, n);
+                    try fvals.append(v.rt.gpa, k.vals[i]);
+                }
+            }
+            if (fnames.items.len > 0) filtered_kw = .{ .names = fnames.items, .vals = fvals.items };
+        }
+        return v.pyCall(mc_obj, &.{ name_s, base_tuple, ns_obj }, filtered_kw);
     }
 
     // обычный класс

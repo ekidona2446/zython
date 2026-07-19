@@ -3,6 +3,7 @@
 //! C3-линеаризация, sys.modules, builtins-дикт.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const object = @import("../object/object.zig");
 
@@ -57,6 +58,8 @@ pub const Runtime = struct {
     file_t: *Type,
     lock_t: *Type,
     local_t: *Type,
+    traceback_t: *Type,
+    frame_t: *Type,
 
     // исключения: имя → тип (иерархия построена в builtins.registerExceptions)
     exc_types: std.StringHashMap(*Type),
@@ -191,6 +194,8 @@ pub const Runtime = struct {
             .file_t = undefined,
             .lock_t = undefined,
             .local_t = undefined,
+            .traceback_t = undefined,
+            .frame_t = undefined,
             .exc_types = std.StringHashMap(*Type).init(gpa),
             .base_exception_t = undefined,
             .exception_t = undefined,
@@ -203,6 +208,21 @@ pub const Runtime = struct {
         rt.builtins_dict.* = Dict.init();
         rt.modules.* = Dict.init();
         rt.sys_path.* = .{ .items = .empty };
+
+        // --- sys.path: cwd + vendored lib + platform-specific site-packages + PYTHONPATH ---
+        try rt.sys_path.items.append(gpa, try rt.newStr("")); // cwd
+        try rt.sys_path.items.append(gpa, try rt.newStr("lib/python3.14")); // vendored
+        try rt.addPlatformSitePaths(gpa);
+        // PYTHONPATH (разделитель: ':' на posix, ';' на windows)
+        if (std.c.getenv("PYTHONPATH")) |pp| {
+            const pps = std.mem.span(pp);
+            const sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
+            var it = std.mem.splitScalar(u8, pps, sep);
+            while (it.next()) |p| {
+                if (p.len == 0) continue;
+                try rt.sys_path.items.append(gpa, try rt.newStr(p));
+            }
+        }
 
         // --- типы ---
         rt.object_t = try rt.mkTypeRaw("object", null);
@@ -253,6 +273,8 @@ pub const Runtime = struct {
         rt.file_t = try rt.mkType("TextIOWrapper", rt.object_t);
         rt.lock_t = try rt.mkType("lock", rt.object_t);
         rt.local_t = try rt.mkType("_local", rt.object_t);
+        rt.traceback_t = try rt.mkType("traceback", rt.object_t);
+        rt.frame_t = try rt.mkType("frame", rt.object_t);
 
         return rt;
     }
@@ -260,6 +282,53 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         self.arena.deinit();
         self.backing.destroy(self.arena);
+    }
+
+    /// Мультиплатформенное заполнение sys.path путями site-packages (Linux/macOS/Windows).
+    fn addPlatformSitePaths(self: *Runtime, gpa: Allocator) !void {
+        const vers = [_][]const u8{ "3.14", "3.13", "3.12" };
+        switch (builtin.os.tag) {
+            .linux => {
+                for (vers) |ver| {
+                    inline for ([_][]const u8{
+                        "/usr/local/lib/python{s}/site-packages",
+                        "/usr/lib/python{s}/site-packages",
+                        "/usr/lib/python{s}",
+                    }) |tmpl| {
+                        try self.sys_path.items.append(gpa, try self.newStr(try std.fmt.allocPrint(gpa, tmpl, .{ver})));
+                    }
+                }
+                try self.sys_path.items.append(gpa, try self.newStr("/usr/lib/python3/dist-packages"));
+                try self.sys_path.items.append(gpa, try self.newStr("/usr/local/lib/python3/dist-packages"));
+            },
+            .macos => {
+                for (vers) |ver| {
+                    inline for ([_][]const u8{
+                        "/opt/homebrew/lib/python{s}/site-packages",
+                        "/usr/local/lib/python{s}/site-packages",
+                        "/Library/Python/{s}/lib/python/site-packages",
+                    }) |tmpl| {
+                        try self.sys_path.items.append(gpa, try self.newStr(try std.fmt.allocPrint(gpa, tmpl, .{ver})));
+                    }
+                }
+            },
+            .windows => {
+                inline for ([_][]const u8{ "314", "313", "312" }) |v| {
+                    inline for ([_][]const u8{
+                        "C:\\Python{s}\\Lib\\site-packages",
+                        "C:\\Program Files\\Python{s}\\Lib\\site-packages",
+                    }) |tmpl| {
+                        try self.sys_path.items.append(gpa, try self.newStr(try std.fmt.allocPrint(gpa, tmpl, .{v})));
+                    }
+                }
+                // user site через APPDATA
+                if (std.c.getenv("APPDATA")) |ar| {
+                    const p = try std.fmt.allocPrint(gpa, "{s}\\Python\\Python313\\site-packages", .{std.mem.span(ar)});
+                    try self.sys_path.items.append(gpa, try self.newStr(p));
+                }
+            },
+            else => {},
+        }
     }
 
     fn dupeTypes(self: *Runtime, types: []const *Type) ![]const *Type {
@@ -313,6 +382,13 @@ pub const Runtime = struct {
         const bt = try self.gpa.alloc(*Type, bases.len);
         for (bases, 0..) |b, i| bt[i] = b.v.type_;
         t.bases = bt;
+        // подкласс type (метакласс) — тоже тип-объект: наследуем is_type_obj от баз
+        for (bt) |b| {
+            if (b.flags.is_type_obj) {
+                t.flags.is_type_obj = true;
+                break;
+            }
+        }
         // __module__ из ns
         const dict_mod = ns; // locals dict уже содержит __module__/__qualname__
         _ = dict_mod;

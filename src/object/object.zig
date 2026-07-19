@@ -290,6 +290,7 @@ pub const Set = struct {
 
 pub const Instance = struct {
     dict: Dict,
+    data: ?*Dict = null, // содержимое для dict-подклассов (отдельно от атрибутов экземпляра)
 };
 
 // ============================================================
@@ -381,6 +382,7 @@ pub const Function = struct {
     defaults: []Obj,
     kwdefaults: ?*Dict,
     annotations: ?*Obj = null,
+    dict: ?*Dict = null, // __dict__ функции (произвольные атрибуты: cache_info, __wrapped__, ...)
 };
 
 pub const Module = struct {

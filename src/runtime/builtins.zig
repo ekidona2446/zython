@@ -146,6 +146,7 @@ fn registerExceptions(rt: *Runtime) !void {
     try excProp(rt, be, "__context__", exc_get_context);
     try excProp(rt, be, "__suppress_context__", exc_get_suppress);
     try excProp(rt, be, "args", exc_get_args);
+    try excProp(rt, be, "__traceback__", exc_get_traceback);
 }
 
 fn excProp(rt: *Runtime, ty: *Type, name: []const u8, comptime f: anytype) !void {
@@ -171,6 +172,29 @@ fn exc_get_suppress(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
 fn exc_get_args(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
     _ = kw;
     return vm.rt.newTuple(args[0].v.exc.args);
+}
+
+/// BaseException.__traceback__ → traceback-объект (tb_frame/tb_next/tb_lineno) или None.
+fn exc_get_traceback(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const rt = v.rt;
+    if (args[0].v != .exc) return rt.newNone();
+    const e = args[0].v.exc;
+    if (e.tb.items.len == 0) return rt.newNone();
+    const last = e.tb.items[e.tb.items.len - 1];
+    // frame-объект
+    const fr = try rt.newInstance(rt.frame_t);
+    try ops.dictSetStr(&fr.v.instance.dict, v, "f_lineno", try rt.newInt(last.lineno));
+    try ops.dictSetStr(&fr.v.instance.dict, v, "f_lasti", try rt.newInt(0));
+    try ops.dictSetStr(&fr.v.instance.dict, v, "f_code", rt.newNone());
+    // traceback-объект
+    const tb = try rt.newInstance(rt.traceback_t);
+    try ops.dictSetStr(&tb.v.instance.dict, v, "tb_frame", fr);
+    try ops.dictSetStr(&tb.v.instance.dict, v, "tb_next", rt.newNone());
+    try ops.dictSetStr(&tb.v.instance.dict, v, "tb_lineno", try rt.newInt(last.lineno));
+    try ops.dictSetStr(&tb.v.instance.dict, v, "tb_lasti", try rt.newInt(0));
+    return tb;
 }
 
 /// BaseException.__init__: сохраняет args
@@ -226,6 +250,26 @@ pub fn registerAll(rt: *Runtime) !void {
     try tmisc.registerGeneratorMethods(rt);
     try tmisc.registerPropertySuperMethods(rt);
     try tmisc.registerFileMethods(rt);
+    // object.__class_getitem__ — generic-подписка для всех типов (list[int], Generic[...])
+    try td(rt, rt.object_t, "__class_getitem__", obj_class_getitem);
+    // Дескрипторы типа function: types.py делает type(function.__code__) и т.п.
+    // Доступ к __code__/__globals__/... на *экземпляре* функции идёт через спец-блок
+    // pyGetAttr(.function); здесь нужны заглушки-дескрипторы для доступа на самом типе.
+    for ([_][]const u8{ "__code__", "__globals__", "__defaults__", "__kwdefaults__", "__closure__", "__annotations__", "__name__", "__qualname__", "__doc__", "__module__", "__dict__" }) |nm| {
+        const prop = try rt.newProperty(.{ .fget = null });
+        try dictPutStartup(rt, rt.function_t.dict, nm, prop);
+    }
+}
+
+/// object.__class_getitem__(cls, item) → GenericAlias (минимально: кортеж (cls, item)).
+fn obj_class_getitem(vm: anytype, args: []const Obj, kw: ?object.KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    if (args.len >= 2) {
+        return v.rt.newTuple(&.{ args[0], args[1] });
+    }
+    if (args.len == 1) return args[0];
+    return v.rt.newNone();
 }
 
 fn registerSingletons(rt: *Runtime) !void {
@@ -258,7 +302,88 @@ fn registerBuiltinTypes(rt: *Runtime) !void {
     try bdt(rt, rt.property_t);
     try bdt(rt, rt.staticm_t);
     try bdt(rt, rt.classm_t);
+    rt.staticm_t.tp_new = staticm_new;
+    rt.classm_t.tp_new = classm_new;
+    {
+        const tn = try rt.newBuiltin("__new__", object.wrapBuiltin(type_new));
+        const sm = try rt.newStaticM(tn);
+        try dictPutStartup(rt, rt.type_t.dict, "__new__", sm);
+    }
+    {
+        const on = try rt.newBuiltin("__new__", object.wrapBuiltin(object_new));
+        const sm = try rt.newStaticM(on);
+        try dictPutStartup(rt, rt.object_t.dict, "__new__", sm);
+    }
     try bdt(rt, rt.super_t);
+    // __new__ в dict builtin-типов: нужно enum._find_data_type ('__new__' in int.__dict__).
+    // Вызов типа идёт через tp_new (приоритетнее), так что это только маркер наличия.
+    {
+        const bn = try rt.newBuiltin("__new__", object.wrapBuiltin(builtin_generic_new));
+        const sm = try rt.newStaticM(bn);
+        for ([_]*object.Type{ rt.int_t, rt.bool_t, rt.float_t, rt.bytes_t, rt.bytearray_t, rt.str_t, rt.tuple_t, rt.list_t, rt.dict_t, rt.set_t, rt.frozenset_t }) |t| {
+            try dictPutStartup(rt, t.dict, "__new__", sm);
+        }
+    }
+}
+
+fn builtin_generic_new(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    if (args.len < 1 or args[0].v != .type_) {
+        return v.rt.newInstance(v.rt.object_t);
+    }
+    return v.rt.newInstance(args[0].v.type_);
+}
+
+/// object.__new__(cls) → новый экземпляр cls.
+fn object_new(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    if (args.len < 1 or args[0].v != .type_) {
+        try v.raiseStr("TypeError", "object.__new__(cls): cls must be a type");
+        return error.PyExc;
+    }
+    return v.rt.newInstance(args[0].v.type_);
+}
+
+/// type.__new__(mcs, name, bases, namespace) → новый класс (или type(x) → тип x).
+fn type_new(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    const v: *VM = vm;
+    if (args.len < 1) {
+        try v.raiseStr("TypeError", "type.__new__() needs at least 1 argument");
+        return error.PyExc;
+    }
+    if (args.len == 1 and args[0].v != .type_) return v.typeOf(args[0]);
+    if (args[0].v == .str) {
+        return v.buildClassFromCall(args, kw);
+    }
+    if (args[0].v == .type_) {
+        // type.__new__(mcs, name, bases, ns): прямое создание (без dispatch на кастомный __new__)
+        return v.buildClassDirect(args[0].v.type_, args[1..]);
+    }
+    return v.typeOf(args[0]);
+}
+
+/// classmethod(f) → .classm Value (дескриптор, связывается с классом при доступе).
+fn classm_new(vm: *VM, cls: *object.Type, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = cls;
+    _ = kw;
+    if (args.len < 1) {
+        try vm.raiseStr("TypeError", "classmethod() needs 1 argument");
+        return error.PyExc;
+    }
+    return vm.rt.newClassM(args[0]);
+}
+
+/// staticmethod(f) → .staticm Value.
+fn staticm_new(vm: *VM, cls: *object.Type, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = cls;
+    _ = kw;
+    if (args.len < 1) {
+        try vm.raiseStr("TypeError", "staticmethod() needs 1 argument");
+        return error.PyExc;
+    }
+    return vm.rt.newStaticM(args[0]);
 }
 
 // ============================================================

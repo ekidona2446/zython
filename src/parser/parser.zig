@@ -1,4 +1,4 @@
-//! Парсер Python — рекурсивный спуск по грамматике 3.13.
+//! Парсер Python — рекурсивный спуск по грамматике 3.x.
 //! Аналог Parser/parser.c (PEG), но классический RD с приоритетами.
 
 const std = @import("std");
@@ -1687,9 +1687,9 @@ pub const Parser = struct {
                 }
                 // парсим выражение
                 const expr = try self.parseInlineExpr(expr_src, line);
-                // формат-спека
+                // формат-спека (есть только при наличии ':'; '!conv' без ':' спеки не даёт)
                 var spec_expr: ?*Expr = null;
-                if (conv_bang != null or conv_colon != null) {
+                if (conv_colon != null) {
                     const spec_src = body[spec_start..j];
                     if (spec_src.len > 0) {
                         // спека может содержать вложенные {expr} — рекурсивно как мини-fstring

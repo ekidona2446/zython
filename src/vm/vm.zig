@@ -881,7 +881,9 @@ pub const VM = struct {
                 .IS_OP => {
                     const b = self.fpop(frame);
                     const a = self.fpop(frame);
-                    const is_ = a == b;
+                    // типы: один Type = один класс, но Obj-обёрток может быть много →
+                    // сравниваем Type-указатель (иначе `base is object` ломается).
+                    const is_ = if (a.v == .type_ and b.v == .type_) a.v.type_ == b.v.type_ else a == b;
                     try frame.stack.append(self.gpa, self.rt.newBool(if (arg == 1) !is_ else is_));
                 },
 
@@ -1019,7 +1021,7 @@ pub const VM = struct {
                         }
                         const nf = try self.makeFrame(ff, args2, kw);
                         frame.stack.shrinkRetainingCapacity(frame.stack.items.len - total - 1);
-                        if (ff.code.flags.generator) {
+                        if (ff.code.flags.generator or ff.code.flags.coroutine) {
                             const gen = try self.rt.newGenerator(nf);
                             try frame.stack.append(self.gpa, gen);
                         } else {
@@ -1030,8 +1032,13 @@ pub const VM = struct {
                             return;
                         }
                     } else {
+                        // shrink считаем от состояния стека ДО вызова: builtin может
+                        // временно растить стек caller'а (например __build_class__ →
+                        // execClassBody → runUntil кладёт return_value тела класса).
+                        // Весь этот мусор отбрасывается; результат builtin возвращает сам.
+                        const len_before = frame.stack.items.len;
                         const result = try self.pyCallRaw(func, args, kw);
-                        frame.stack.shrinkRetainingCapacity(frame.stack.items.len - total - 1);
+                        frame.stack.shrinkRetainingCapacity(len_before - total - 1);
                         try frame.stack.append(self.gpa, result);
                     }
                 },
@@ -1202,9 +1209,11 @@ pub const VM = struct {
                 },
 
                 .IMPORT_NAME => {
-                    const fromlist = self.fpop(frame);
+                    const fromlist_raw = self.fpop(frame);
                     const level_obj = self.fpop(frame);
                     const level: i64 = if (level_obj.v == .int) level_obj.v.int else 0;
+                    // Python None как fromlist означает "обычный import a.b" (не from-import)
+                    const fromlist: ?Obj = if (fromlist_raw.v == .none or fromlist_raw.v == .bool_) null else fromlist_raw;
                     const import_mod = @import("../runtime/import.zig");
                     const mod = try import_mod.importModule(self, names[arg], @intCast(level), fromlist, frame.globals, frame);
                     try frame.stack.append(self.gpa, mod);
@@ -1533,6 +1542,63 @@ pub const VM = struct {
         return self.rt.mkObj(self.rt.type_t, .{ .type_ = t });
     }
 
+    /// Прямое создание класса (без dispatch на кастомный __new__) — для type.__new__.
+    pub fn buildClassDirect(self: *VM, meta: *object.Type, args: []const Obj) anyerror!Obj {
+        if (args.len < 3 or args[0].v != .str) {
+            try self.raiseStr("TypeError", "type.__new__() needs (name, bases, dict)");
+            return error.PyExc;
+        }
+        const bases = try self.collectSequence(args[1], null);
+        // namespace: dict или dict-подкласс (instance, напр. enum._EnumDict → instance.data)
+        const ns_dict: *object.Dict = switch (args[2].v) {
+            .dict => |d| d,
+            .instance => |i| blk: {
+                if (i.data) |d| break :blk d;
+                break :blk &i.dict;
+            },
+            else => {
+                try self.raiseStr("TypeError", "type.__new__() argument 3 must be dict");
+                return error.PyExc;
+            },
+        };
+        const t = try self.rt.newUserType(args[0].v.str.bytes, self, bases, ns_dict);
+        t.ty = meta; // настоящий метакласс класса (нужен для __mro__/isinstance)
+        return self.rt.mkObj(meta, .{ .type_ = t });
+    }
+
+    /// Создание класса через вызов метакласса: Meta(name, bases, dict) → класс с ty=meta.
+    pub fn buildClassFromCallMeta(self: *VM, meta: *object.Type, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+        if (args[0].v != .str) {
+            try self.raiseStr("TypeError", "type() argument 1 must be str");
+            return error.PyExc;
+        }
+        // Кастомный __new__ метакласса (Python-функция, как EnumType.__new__):
+        // meta(name, bases, ns) → meta.__new__(meta, name, bases, ns) — аналог CPython type_call.
+        if (ops.lookupClass(meta, "__new__")) |new_| {
+            switch (new_.v) {
+                .function, .method => {
+                    const meta_obj = try self.rt.mkObj(self.rt.type_t, .{ .type_ = meta });
+                    return self.pyCall(new_, &.{ meta_obj, args[0], args[1], args[2] }, kw);
+                },
+                .staticm => |s| {
+                    const meta_obj = try self.rt.mkObj(self.rt.type_t, .{ .type_ = meta });
+                    return self.pyCall(s.callable, &.{ meta_obj, args[0], args[1], args[2] }, kw);
+                },
+                else => {},
+            }
+        }
+        // default: прямое создание типа
+        const bases = try self.collectSequence(args[1], null);
+        if (args[2].v != .dict) {
+            try self.raiseStr("TypeError", "type() argument 3 must be dict");
+            return error.PyExc;
+        }
+        const t = try self.rt.newUserType(args[0].v.str.bytes, self, bases, args[2].v.dict);
+        t.ty = meta; // настоящий метакласс класса
+        // новый класс — экземпляр метакласса meta
+        return self.rt.mkObj(meta, .{ .type_ = t });
+    }
+
     pub fn pyTruthy(self: *VM, o: Obj) anyerror!bool {
         switch (o.v) {
             .instance, .exc => {},
@@ -1769,6 +1835,19 @@ pub const VM = struct {
             },
             else => {},
         }
+        // subscript на классе: __class_getitem__ (неявный classmethod) — list[int], Generic[...]
+        if (o.v == .type_) {
+            const cls = o.v.type_;
+            if (ops.lookupClass(cls, "__class_getitem__")) |cg| {
+                switch (cg.v) {
+                    .builtin => return self.pyCall(cg, &.{ o, sub }, null),
+                    else => {
+                        const bound = try ops.descrGet(self, cg, o, cls);
+                        return self.pyCall(bound, &.{sub}, null);
+                    },
+                }
+            }
+        }
         if (ops.lookupSpecial(self, o, "__getitem__")) |gm| {
             return self.pyCall(gm, &.{sub}, null);
         }
@@ -1976,6 +2055,73 @@ pub const VM = struct {
             bop;
 
         if (try self.numericBinary(base_op, a, b)) |r| return r;
+
+        // PEP 604: X | Y для типов → union (минимально: кортеж типов; types.UnionType = type(int|str))
+        if (base_op == .bit_or and a.v == .type_ and b.v == .type_) {
+            return self.rt.newTuple(&.{ a, b });
+        }
+
+        // операции над множествами: & | - ^
+        if (a.v == .set and (b.v == .set or b.v == .frozenset)) {
+            const bd: *object.Set = if (b.v == .set) b.v.set else b.v.frozenset;
+            switch (base_op) {
+                .bit_and => {
+                    const out = try self.rt.newSetObj(false, &.{});
+                    var it = a.v.set.dict.iterAlive();
+                    while (it.next()) |e| {
+                        const h = try self.pyHash(e.key.?);
+                        if (try bd.dict.getWithHash(self.rt, e.key.?, h)) |_| {
+                            try out.v.set.dict.setWithHash(self.rt, e.key.?, self.rt.newNone(), h);
+                        }
+                    }
+                    return out;
+                },
+                .bit_or => {
+                    const out = try self.rt.newSetObj(false, &.{});
+                    var it = a.v.set.dict.iterAlive();
+                    while (it.next()) |e| {
+                        const h = try self.pyHash(e.key.?);
+                        try out.v.set.dict.setWithHash(self.rt, e.key.?, self.rt.newNone(), h);
+                    }
+                    var it2 = bd.dict.iterAlive();
+                    while (it2.next()) |e| {
+                        const h = try self.pyHash(e.key.?);
+                        try out.v.set.dict.setWithHash(self.rt, e.key.?, self.rt.newNone(), h);
+                    }
+                    return out;
+                },
+                .sub => {
+                    const out = try self.rt.newSetObj(false, &.{});
+                    var it = a.v.set.dict.iterAlive();
+                    while (it.next()) |e| {
+                        const h = try self.pyHash(e.key.?);
+                        if ((try bd.dict.getWithHash(self.rt, e.key.?, h)) == null) {
+                            try out.v.set.dict.setWithHash(self.rt, e.key.?, self.rt.newNone(), h);
+                        }
+                    }
+                    return out;
+                },
+                .bit_xor => {
+                    const out = try self.rt.newSetObj(false, &.{});
+                    var it = a.v.set.dict.iterAlive();
+                    while (it.next()) |e| {
+                        const h = try self.pyHash(e.key.?);
+                        if ((try bd.dict.getWithHash(self.rt, e.key.?, h)) == null) {
+                            try out.v.set.dict.setWithHash(self.rt, e.key.?, self.rt.newNone(), h);
+                        }
+                    }
+                    var it2 = bd.dict.iterAlive();
+                    while (it2.next()) |e| {
+                        const h = try self.pyHash(e.key.?);
+                        if ((try a.v.set.dict.getWithHash(self.rt, e.key.?, h)) == null) {
+                            try out.v.set.dict.setWithHash(self.rt, e.key.?, self.rt.newNone(), h);
+                        }
+                    }
+                    return out;
+                },
+                else => {},
+            }
+        }
 
         if (base_op == .add) {
             if (a.v == .str and b.v == .str) {

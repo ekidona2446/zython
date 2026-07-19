@@ -53,11 +53,22 @@ fn selfList(args: []const Obj, vm: *VM) !*object.List {
 }
 
 fn selfDict(args: []const Obj, vm: *VM) !*Dict {
-    if (args.len == 0 or args[0].v != .dict) {
+    if (args.len == 0) {
         try vm.raiseStr("TypeError", "descriptor requires a 'dict' object");
         return error.PyExc;
     }
-    return args[0].v.dict;
+    // dict или dict-подкласс (instance, напр. enum._EnumDict): содержимое в instance.data
+    return switch (args[0].v) {
+        .dict => |d| d,
+        .instance => |i| blk: {
+            if (i.data == null) i.data = try vm.rt.newDict();
+            break :blk i.data.?;
+        },
+        else => {
+            try vm.raiseStr("TypeError", "descriptor requires a 'dict' object");
+            return error.PyExc;
+        },
+    };
 }
 
 // ============================================================
@@ -70,6 +81,24 @@ pub fn registerObjectMethods(rt: *Runtime) !void {
     try td(rt, rt.object_t, "__str__", obj_repr);
     try td(rt, rt.object_t, "__init_subclass__", obj_init_subclass);
     try td(rt, rt.object_t, "__format__", obj_format);
+    try td(rt, rt.object_t, "__reduce_ex__", obj_reduce_ex);
+    try td(rt, rt.object_t, "__reduce__", obj_reduce);
+    try td(rt, rt.object_t, "__sizeof__", obj_sizeof);
+}
+
+fn obj_reduce_ex(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const cls = try v.typeOf(args[0]);
+    return v.rt.newTuple(&.{ cls, try v.rt.newTuple(&.{}) });
+}
+fn obj_reduce(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    return obj_reduce_ex(vm, args, kw);
+}
+fn obj_sizeof(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = args;
+    _ = kw;
+    return vm.rt.newInt(16);
 }
 
 fn obj_init(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
@@ -1704,6 +1733,58 @@ pub fn registerDictMethods(rt: *Runtime) !void {
     try td(rt, t, "copy", dict_copy);
     try td(rt, t, "fromkeys", dict_fromkeys);
     try td(rt, t, "__contains__", dict_contains);
+    try td(rt, t, "__setitem__", dict_setitem);
+    try td(rt, t, "__getitem__", dict_getitem);
+    try td(rt, t, "__delitem__", dict_delitem);
+    try td(rt, t, "__len__", dict_len);
+    try td(rt, t, "__iter__", dict_iter_m);
+}
+
+fn dict_iter_m(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const d = try selfDict(args, v);
+    return v.rt.newIter(.{ .dict_iter = .{ .d = d, .i = 0, .kind = .keys } });
+}
+
+fn dict_setitem(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const d = try selfDict(args, v);
+    const h = try v.pyHash(args[1]);
+    try d.setWithHash(v, args[1], args[2], h);
+    return v.rt.newNone();
+}
+
+fn dict_getitem(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const d = try selfDict(args, v);
+    const h = try v.pyHash(args[1]);
+    if (try d.getWithHash(v, args[1], h)) |x| return x;
+    const cls = v.excType("KeyError");
+    const e = try v.rt.newExc(cls);
+    const ka = try v.rt.gpa.alloc(Obj, 1);
+    ka[0] = args[1];
+    e.v.exc.args = ka;
+    try v.raiseObj(e);
+    return error.PyExc;
+}
+
+fn dict_delitem(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const d = try selfDict(args, v);
+    const h = try v.pyHash(args[1]);
+    _ = try d.delWithHash(v, args[1], h);
+    return v.rt.newNone();
+}
+
+fn dict_len(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const d = try selfDict(args, v);
+    return v.rt.newInt(@intCast(d.len()));
 }
 
 fn dict_get(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {

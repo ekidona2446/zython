@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn printVersion() void {
-    std.debug.print("Zython {s} (compatible with Python 3.13)\n", .{zython.version_string});
+    std.debug.print("Zython {s} (compatible with Python 3.14.6)\n", .{zython.version_string});
     std.debug.print("Zig {d}.{d}.{d}, libxev backend: {s}\n", .{
         builtin.zig_version.major,
         builtin.zig_version.minor,
@@ -114,10 +114,10 @@ fn printHelp() void {
     const help =
         \\usage: zython [option] ... [-c cmd | -m mod | file | -] [arg] ...
         \\Options:
-        \\  -c cmd   : программа как строка
-        \\  -m mod   : запустить модуль как __main__
-        \\  -V, --version : версия
-        \\  -h, --help    : помощь
+        \\  -c cmd   : Program passed as string
+        \\  -m mod   : Run module as __main__
+        \\  -V, --version : Show version
+        \\  -h, --help    : Show this help
         \\
     ;
     std.debug.print("{s}", .{help});

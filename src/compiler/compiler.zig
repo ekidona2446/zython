@@ -1073,9 +1073,8 @@ pub const Compiler = struct {
                 const nargs: u16 = @intCast(2 + x.bases.len);
                 const nkw: u16 = @intCast(x.keywords.len);
                 self.emitOp(scope, .CALL, nargs | (nkw << 8), s.lineno);
-                // декораторы
+                // декораторы: стек [deco1, ..., decoN, cls] → CALL 1 даёт decoN(cls) и т.д.
                 for (x.decorator_list) |_| {
-                    self.emit0(scope, .ROT_TWO, s.lineno);
                     self.emitOp(scope, .CALL, 1, s.lineno);
                 }
                 try self.emitStoreName(scope, x.name, s.lineno);
@@ -1828,9 +1827,10 @@ pub const Compiler = struct {
             self.emitOp(scope, .BUILD_TUPLE, @intCast(child.freevars.items.len), line);
         }
         self.emitOp(scope, .MAKE_FUNCTION, flags, line);
-        // декораторы (на стеке до этого: func — после декораторов)
+        // декораторы: на стеке [deco1, ..., decoN, func].
+        // CALL 1 берёт [callable=decoN, arg=func] → decoN(func); затем decoN-1(...) и т.д.
+        // Итог: deco1(deco2(...(decoN(func)))) — как в CPython. ROT_TWO здесь не нужен.
         for (0..ndec) |_| {
-            self.emit0(scope, .ROT_TWO, line);
             self.emitOp(scope, .CALL, 1, line);
         }
     }
@@ -1924,6 +1924,9 @@ pub const Compiler = struct {
         const cidx = try self.addConst(scope, code_obj);
 
         var flags: u16 = 0;
+        // code — первым (вниз стека), closure — последним (TOS), как в emitFunctionFromScope:
+        // MAKE_FUNCTION снимает closure (0x04) с вершины, затем code остаётся.
+        self.emitOp(scope, .LOAD_CONST, cidx, line);
         if (child.freevars.items.len > 0) {
             flags |= 0x04;
             for (child.freevars.items) |fv| {
@@ -1932,7 +1935,6 @@ pub const Compiler = struct {
             }
             self.emitOp(scope, .BUILD_TUPLE, @intCast(child.freevars.items.len), line);
         }
-        self.emitOp(scope, .LOAD_CONST, cidx, line);
         self.emitOp(scope, .MAKE_FUNCTION, flags, line);
         self.emit0(scope, .ROT_TWO, line); // [fn, iter]
         self.emitOp(scope, .CALL, 1, line);
