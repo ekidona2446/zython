@@ -1,18 +1,18 @@
-//! Zython CLI - аналог Programs/python.c и Modules/main.c
+//! Zython CLI — аналог Programs/python.c и Modules/main.c
 //! Точка входа интерпретатора
-//! Zig 0.16.0 - использует новый std.process.Init API
+//! Zig 0.16.0 — использует std.process.Init API
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zython = @import("zython");
 const xev = @import("xev");
 
 const version_string = zython.version.version_string;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa; // arena allocator via init
+    const allocator = init.gpa;
     const io = init.io;
 
-    // Собираем аргументы через итератор
     var args_iter = try init.minimal.args.iterateAllocator(allocator);
     defer args_iter.deinit();
 
@@ -38,9 +38,16 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            const zver = builtin.zig_version;
             std.debug.print("Zython {s}\n", .{version_string});
-            std.debug.print("Zig 0.16.0 + libxev async runtime\n", .{});
-            std.debug.print("Compatible with Python 3.12+\n", .{});
+            std.debug.print("Zig {d}.{d}.{d} + libxev async runtime ({s} backend)\n", .{
+                zver.major,
+                zver.minor,
+                zver.patch,
+                @tagName(xev.backend),
+            });
+            std.debug.print("Compatible with Python 3.13+\n", .{});
+            std.debug.print("Platform: {s}-{s}\n", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
             return;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
@@ -93,10 +100,11 @@ fn printHelp() void {
         \\  --ast file     Dump AST of Python file
         \\
         \\Zython features:
-        \\  - Compatible with Python 3.x syntax
-        \\  - Built-in async via libxev (io_uring, kqueue, epoll)
-        \\  - Zig 0.16.0 package manager
+        \\  - Compatible with Python 3.13+ syntax
+        \\  - Built-in async via libxev (io_uring, kqueue, IOCP)
         \\  - No GIL needed (libxev thread pool)
+        \\  - Zig standard library accessible via `from zython import std`
+        \\  - Cross-platform: Linux, macOS, Windows, FreeBSD
         \\
         \\Examples:
         \\  zython script.py
@@ -107,15 +115,13 @@ fn printHelp() void {
 }
 
 fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
-    std.debug.print("Zython {s} on {s}\n", .{ version_string, @tagName(@import("builtin").os.tag) });
+    std.debug.print("Zython {s} on {s}-{s}\n", .{ version_string, @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
     std.debug.print("Type \"help\", \"copyright\", \"credits\" or \"license\" for more information.\n", .{});
-    std.debug.print(">>> Integrated with libxev async runtime (io_uring available: {})\n", .{true});
+    std.debug.print(">>> libxev backend: {s}, no GIL\n", .{@tagName(xev.backend)});
 
     var interp = try zython.Interpreter.init(allocator, io);
     defer interp.deinit();
 
-    // Используем старый std.io.getStdIn для простоты - в 0.16 он требует io, но debug используем stdin via posix?
-    // Для REPL пока упростим: используем std.io.getStdIn() через legacy если доступен, иначе fail
     var buf: [4096]u8 = undefined;
     var stdin_buffer: [1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
@@ -128,7 +134,6 @@ fn runRepl(allocator: std.mem.Allocator, io: std.Io) !void {
             break;
         };
 
-        // Копируем в buf для обработки
         const len = @min(line.len, buf.len - 1);
         @memcpy(buf[0..len], line[0..len]);
         const trimmed = std.mem.trim(u8, buf[0..len], " \t\r\n");
@@ -157,7 +162,7 @@ fn runFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
     var interp = try zython.Interpreter.init(allocator, io);
     defer interp.deinit();
 
-    std.debug.print("[Zython] Initializing libxev loop (backend: {s})\n", .{@tagName(xev.backend)});
+    std.debug.print("[Zython] libxev backend: {s}\n", .{@tagName(xev.backend)});
 
     const result = interp.execFile(path) catch |err| {
         std.debug.print("[Zython] Runtime error: {any}\n", .{err});
@@ -201,9 +206,6 @@ fn runCodeString(allocator: std.mem.Allocator, io: std.Io, code: []const u8) !vo
 }
 
 fn disassembleFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    // Читаем файл - используем std.fs.cwd().readFileAlloc с Io?
-    // Для совместимости используем старый API через Io
-    // Упрощенно: используем std.fs.cwd().readFileAlloc с arena
     const file_content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(file_content);
 
@@ -248,7 +250,7 @@ fn disassembleFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
         const arg_lo = code_obj.code[pc + 1];
         const arg_hi = code_obj.code[pc + 2];
         const arg = @as(u16, arg_lo) | (@as(u16, arg_hi) << 8);
-        std.debug.print("  {d:4}: {s:20} {d}", .{ pc, op.toString(), arg });
+        std.debug.print("  {d:4}: {s:30} {d}", .{ pc, op.toString(), arg });
 
         if (op == .LOAD_CONST and arg < code_obj.consts.len) {
             const r = try code_obj.consts[arg].repr(allocator);

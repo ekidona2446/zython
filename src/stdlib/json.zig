@@ -1,6 +1,5 @@
-//! json module - аналог Lib/json/ + Modules/_json.c
-//! В CPython _json - C расширение для скорости, в Zython - Zig реализация
-//! Поддерживает json.loads / dumps, используя Zig std.json
+//! json module — аналог Lib/json/ + Modules/_json.c
+//! Использует Zig std.json для реального парсинга и сериализации
 
 const std = @import("std");
 const object = @import("../object/object.zig");
@@ -44,24 +43,20 @@ pub const JsonModule = struct {
             else => return error.TypeError,
         };
 
-        std.debug.print("[Zython json] loads({s}) via Zig std.json\n", .{json_str});
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch {
+            return error.JsonDecodeError;
+        };
+        defer parsed.deinit();
 
-        if (std.mem.startsWith(u8, std.mem.trim(u8, json_str, " \t\n"), "{")) {
-            return try object.PyObject.newDict(allocator);
-        } else if (std.mem.startsWith(u8, std.mem.trim(u8, json_str, " \t\n"), "[")) {
-            return try object.PyObject.newList(allocator);
-        } else {
-            return try object.PyObject.newStr(allocator, json_str);
-        }
+        return jsonValueToPy(allocator, parsed.value);
     }
 
     fn dumps(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
         if (args.len == 0) return error.TypeError;
-        const repr = try args[0].repr(allocator);
-        defer allocator.free(repr);
-        std.debug.print("[Zython json] dumps via Zig, input: {s}\n", .{repr});
+        const json_val = try pyToJsonValue(allocator, args[0]);
+        // json.Value doesn't need deinit for simple types — the arena from parseFromSlice handles it
 
-        const json_str = try std.fmt.allocPrint(allocator, "{{\"{s}\"}}", .{repr});
+        const json_str = try std.json.Stringify.valueAlloc(allocator, json_val, .{});
         defer allocator.free(json_str);
         return try object.PyObject.newStr(allocator, json_str);
     }
@@ -74,5 +69,71 @@ pub const JsonModule = struct {
     fn dump(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
         _ = args;
         return try object.PyObject.newNone(allocator);
+    }
+
+    fn jsonValueToPy(allocator: Allocator, val: std.json.Value) anyerror!object.ObjectPtr {
+        return switch (val) {
+            .null => try object.PyObject.newNone(allocator),
+            .bool => |b| try object.PyObject.newBool(allocator, b),
+            .integer => |i| try object.PyObject.newInt(allocator, @intCast(i)),
+            .float => |f| try object.PyObject.newFloat(allocator, f),
+            .number_string => |s| try object.PyObject.newStr(allocator, s),
+            .string => |s| try object.PyObject.newStr(allocator, s),
+            .array => |arr| {
+                const list_obj = try object.PyObject.newList(allocator);
+                for (arr.items) |item| {
+                    const py_item = try jsonValueToPy(allocator, item);
+                    try list_obj.value.List.items.append(allocator, py_item);
+                }
+                return list_obj;
+            },
+            .object => |obj| {
+                const dict_obj = try object.PyObject.newDict(allocator);
+                var iter = obj.iterator();
+                while (iter.next()) |entry| {
+                    const val_obj = try jsonValueToPy(allocator, entry.value_ptr.*);
+                    val_obj.incref();
+                    try dict_obj.value.Dict.map.put(entry.key_ptr.*, val_obj);
+                }
+                return dict_obj;
+            },
+        };
+    }
+
+    fn pyToJsonValue(allocator: Allocator, obj: *const object.PyObject) anyerror!std.json.Value {
+        return switch (obj.value) {
+            .None => std.json.Value.null,
+            .Bool => |b| std.json.Value{ .bool = b },
+            .Int => |iv| std.json.Value{ .integer = switch (iv) {
+                .Small => |v| v,
+                .Big => 0,
+            } },
+            .Float => |f| std.json.Value{ .float = f },
+            .Str => |s| std.json.Value{ .string = s },
+            .List => |*l| {
+                var arr = std.json.Array.init(allocator);
+                for (l.items.items) |item| {
+                    const val = try pyToJsonValue(allocator, item);
+                    try arr.append(val);
+                }
+                return std.json.Value{ .array = arr };
+            },
+            .Dict => |*d| {
+                // Build ObjectMap by inserting key-value pairs one at a time
+                var keys: std.ArrayList([]const u8) = .empty;
+                defer keys.deinit(allocator);
+                var vals: std.ArrayList(std.json.Value) = .empty;
+                defer vals.deinit(allocator);
+                var iter = d.map.iterator();
+                while (iter.next()) |entry| {
+                    try keys.append(allocator, entry.key_ptr.*);
+                    const val = try pyToJsonValue(allocator, entry.value_ptr.*);
+                    try vals.append(allocator, val);
+                }
+                const obj_map = try std.json.ObjectMap.init(allocator, keys.items, vals.items);
+                return std.json.Value{ .object = obj_map };
+            },
+            else => std.json.Value.null,
+        };
     }
 };

@@ -1,5 +1,8 @@
-//! sys module - аналог Python/sysmodule.c
+//! sys module — аналог Python/sysmodule.c
+//! Платформенно-независимая версия
+
 const std = @import("std");
+const builtin = @import("builtin");
 const object = @import("../object/object.zig");
 const Allocator = std.mem.Allocator;
 
@@ -8,8 +11,23 @@ pub const SysModule = struct {
         var dict: std.StringHashMap(object.ObjectPtr) = undefined;
         dict = std.StringHashMap(object.ObjectPtr).init(allocator);
 
-        const version = try object.PyObject.newStr(allocator, "3.12.0 (Zython 0.1.0, Zig 0.16.0 + libxev)");
+        const zver = builtin.zig_version;
+        const ver_str = try std.fmt.allocPrint(allocator, "3.13.0 (Zython 0.1.0, Zig {d}.{d}.{d} + libxev)", .{
+            zver.major,
+            zver.minor,
+            zver.patch,
+        });
+        const version = try object.PyObject.newStr(allocator, ver_str);
+        allocator.free(ver_str);
         try dict.put("version", version);
+
+        const platform = try std.fmt.allocPrint(allocator, "{s}-{s}", .{
+            @tagName(builtin.os.tag),
+            @tagName(builtin.cpu.arch),
+        });
+        const platform_obj = try object.PyObject.newStr(allocator, platform);
+        allocator.free(platform);
+        try dict.put("platform", platform_obj);
 
         const path_list = try object.PyObject.newList(allocator);
         const dot = try object.PyObject.newStr(allocator, ".");
@@ -23,10 +41,21 @@ pub const SysModule = struct {
         const modules_dict = try object.PyObject.newDict(allocator);
         try dict.put("modules", modules_dict);
 
+        // sys.executable
+        const exe_path = try object.PyObject.newStr(allocator, "zython");
+        try dict.put("executable", exe_path);
+
+        // sys.byteorder
+        const byteorder = try object.PyObject.newStr(allocator, switch (builtin.cpu.arch.endian()) {
+            .little => "little",
+            .big => "big",
+        });
+        try dict.put("byteorder", byteorder);
+
         const module_val = object.ModuleValue{
             .name = "sys",
             .dict = dict,
-            .file = "sys.py (zig)",
+            .file = "sys (zig, cross-platform)",
         };
 
         return try object.PyObject.create(allocator, &object.ModuleType, .{ .Module = module_val });

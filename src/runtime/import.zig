@@ -1,6 +1,8 @@
-//! Система импорта - аналог Python/import.c
+//! Система импорта — аналог Python/import.c
+//! Кроссплатформенная: пути поиска зависят от ОС
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const object = @import("../object/object.zig");
 
@@ -14,19 +16,37 @@ pub const ImportSystem = struct {
     pub const BuiltinInitFn = *const fn (allocator: Allocator) anyerror!object.ObjectPtr;
 
     pub fn init(allocator: Allocator) !ImportSystem {
-        // For tests without explicit Io, use a default threaded Io
         const io = std.testing.io;
         return try initWithIo(allocator, io);
     }
 
     pub fn initWithIo(allocator: Allocator, io: std.Io) !ImportSystem {
         var search_paths: std.ArrayList([]const u8) = .empty;
-        try search_paths.append(allocator, ".");
-        try search_paths.append(allocator, "./Lib");
-        try search_paths.append(allocator, "./python_modules");
-        try search_paths.append(allocator, "./vendor/uvicorn");
-        try search_paths.append(allocator, "/usr/lib/python3.12");
-        try search_paths.append(allocator, "/usr/local/lib/python3.12");
+        // Dupe all paths so we can safely free them in deinit
+        try search_paths.append(allocator, try allocator.dupe(u8, "."));
+        try search_paths.append(allocator, try allocator.dupe(u8, "./Lib"));
+        try search_paths.append(allocator, try allocator.dupe(u8, "./python_modules"));
+
+        // Platform-specific standard library paths
+        const os_tag = builtin.os.tag;
+        const lib_suffix = switch (os_tag) {
+            .linux => "/lib/python3.13",
+            .macos => "/lib/python3.13",
+            .windows => "\\Lib",
+            .freebsd, .openbsd, .netbsd => "/lib/python3.13",
+            else => "/lib/python3.13",
+        };
+
+        const prefix_paths = switch (os_tag) {
+            .linux => &[_][]const u8{ "/usr", "/usr/local" },
+            .macos => &[_][]const u8{ "/usr/local", "/opt/homebrew" },
+            else => &[_][]const u8{ "/usr/local" },
+        };
+
+        for (prefix_paths) |prefix| {
+            const path = try std.fs.path.join(allocator, &.{ prefix, lib_suffix });
+            try search_paths.append(allocator, path);
+        }
 
         return .{
             .allocator = allocator,
@@ -39,6 +59,9 @@ pub const ImportSystem = struct {
 
     pub fn deinit(self: *ImportSystem) void {
         self.modules.deinit();
+        for (self.search_paths.items) |p| {
+            self.allocator.free(p);
+        }
         self.search_paths.deinit(self.allocator);
         self.builtin_modules.deinit();
     }
@@ -62,7 +85,6 @@ pub const ImportSystem = struct {
                 const full_path = try std.fs.path.join(self.allocator, &.{ search_path, rel_path });
                 defer self.allocator.free(full_path);
 
-                // Try access via Io.Dir
                 std.Io.Dir.cwd().access(self.io, full_path, .{}) catch continue;
                 return try self.allocator.dupe(u8, full_path);
             }

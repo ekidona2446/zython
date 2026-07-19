@@ -1,6 +1,9 @@
-//! socket module - аналог Modules/socketmodule.c
+//! socket module — аналог Modules/socketmodule.c
 //! Переписан на Zig с использованием libxev (xev.TCP, xev.UDP) для встроенной асинхронности
+//! Кроссплатформенный
+
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
 const object = @import("../object/object.zig");
 const Allocator = std.mem.Allocator;
@@ -10,14 +13,35 @@ pub const SocketModule = struct {
         var dict: std.StringHashMap(object.ObjectPtr) = undefined;
         dict = std.StringHashMap(object.ObjectPtr).init(allocator);
 
+        // Address families
         const af_inet = try object.PyObject.newInt(allocator, 2);
         try dict.put("AF_INET", af_inet);
+        const af_inet6 = try object.PyObject.newInt(allocator, 10);
+        try dict.put("AF_INET6", af_inet6);
+        const af_unix = try object.PyObject.newInt(allocator, 1);
+        try dict.put("AF_UNIX", af_unix);
 
+        // Socket types
         const sock_stream = try object.PyObject.newInt(allocator, 1);
         try dict.put("SOCK_STREAM", sock_stream);
+        const sock_dgram = try object.PyObject.newInt(allocator, 2);
+        try dict.put("SOCK_DGRAM", sock_dgram);
 
+        // socket() function
         const socket_fn = try createBuiltin(allocator, "socket", socketFn);
         try dict.put("socket", socket_fn);
+
+        // create_connection
+        const connect_fn = try createBuiltin(allocator, "create_connection", createConnection);
+        try dict.put("create_connection", connect_fn);
+
+        // getaddrinfo — simplified
+        const getaddrinfo_fn = try createBuiltin(allocator, "getaddrinfo", getaddrinfo);
+        try dict.put("getaddrinfo", getaddrinfo_fn);
+
+        // gaierror
+        const gaierror = try object.PyObject.newStr(allocator, "gaierror");
+        try dict.put("gaierror", gaierror);
 
         const module_val = object.ModuleValue{
             .name = "socket",
@@ -35,40 +59,20 @@ pub const SocketModule = struct {
 
     fn socketFn(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
         _ = args;
-        // В реальном Zython: создает xev.TCP socket
-        // xev.TCP.init(address) -> non-blocking, используем io_uring на Linux
-        std.debug.print("[Zython socket] socket() -> xev.TCP (io_uring)\n", .{});
+        // Создаёт объект сокета — в реальном Zython использует xev.TCP
+        // xev.TCP.init(address) -> non-blocking
+        const result_dict = try object.PyObject.newDict(allocator);
+        return result_dict;
+    }
+
+    fn createConnection(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
+        _ = args;
         return try object.PyObject.newNone(allocator);
     }
-};
 
-/// zycorn - Zython + Uvicorn, HTTP сервер на libxev
-/// Аналог uvicorn, но на Zig + libxev вместо asyncio + uvloop
-pub const ZycornServer = struct {
-    allocator: Allocator,
-    loop: *xev.Loop,
-    address: std.net.Address,
-    tcp: ?xev.TCP,
-
-    pub fn init(allocator: Allocator, loop: *xev.Loop, host: []const u8, port: u16) !ZycornServer {
-        const addr = try std.net.Address.parseIp(host, port);
-        var tcp = try xev.TCP.init(addr);
-        try tcp.bind(addr);
-        try tcp.listen(128);
-
-        return .{
-            .allocator = allocator,
-            .loop = loop,
-            .address = addr,
-            .tcp = tcp,
-        };
-    }
-
-    pub fn serve(self: *ZycornServer) !void {
-        std.debug.print("[zycorn] Serving on {any} via libxev (io_uring backend)\n", .{self.address});
-        // В реальном zycorn: accept loop через xev.Completion
-        // var c: xev.Completion = undefined;
-        // self.tcp.?.accept(self.loop, &c, Self, self, acceptCallback);
-        // try self.loop.run(.until_done);
+    fn getaddrinfo(args: []*object.PyObject, allocator: Allocator) anyerror!object.ObjectPtr {
+        _ = args;
+        // Simplified — returns empty list
+        return try object.PyObject.newList(allocator);
     }
 };

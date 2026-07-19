@@ -32,8 +32,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.link_libc = true;
+    // Platform-specific linking
     if (target.result.os.tag == .linux) {
         exe.root_module.linkSystemLibrary("m", .{});
+        exe.root_module.linkSystemLibrary("pthread", .{});
     }
     b.installArtifact(exe);
 
@@ -44,7 +46,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // zpip - pip on Zig with libxev
+    // zpip — pip on Zig with libxev
     const zpip_exe = b.addExecutable(.{
         .name = "zpip",
         .root_module = b.createModule(.{
@@ -69,20 +71,7 @@ pub fn build(b: *std.Build) void {
         zpip_run_cmd.addArgs(args);
     }
 
-    // pip step - install Python deps via pip into python_modules/
-    const pip_step = b.step("pip", "Install Python packages via pip into python_modules/");
-    const pip_cmd = b.addSystemCommand(&.{ "python3", "-m", "pip", "install", "--target=python_modules", "--upgrade", "pip", "setuptools", "wheel" });
-    pip_step.dependOn(&pip_cmd.step);
-
-    const uvicorn_install_step = b.step("uvicorn-install", "Install uvicorn into python_modules/");
-    const uvicorn_cmd = b.addSystemCommand(&.{ "python3", "-m", "pip", "install", "--target=python_modules", "uvicorn", "h11", "click" });
-    uvicorn_install_step.dependOn(&uvicorn_cmd.step);
-
-    const zycorn_step = b.step("zycorn", "Run zycorn (Zython's uvicorn on libxev) demo");
-    const zycorn_cmd = b.addRunArtifact(exe);
-    zycorn_cmd.addArgs(&.{ "examples/uvicorn_demo/app.py" });
-    zycorn_step.dependOn(&zycorn_cmd.step);
-
+    // Tests
     const mod_tests = b.addTest(.{
         .root_module = zython_mod,
     });
