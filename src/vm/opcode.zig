@@ -1,304 +1,174 @@
-//! Байт-коды Python — аналог Include/opcode.h и Python/ceval.c
-//! Совместимость с CPython 3.13+ opcodes (opcode_ids.h)
-//! Нумерация обновлена в соответствии с CPython main branch
-//! Zython использует тот же набор опкодов для совместимости с .pyc,
-//! но с расширениями ZYTHON_* для libxev
-
-const std = @import("std");
+//! Набор байткод-опкодов Zython (аналог Include/opcode.h, но собственный).
+//! Традиционная стек-машина: 1 байт op + 2 байта аргумент (little endian).
 
 pub const Opcode = enum(u8) {
-    // === CPython 3.13 opcode_ids.h — точное соответствие ===
-    CACHE = 0,
-    BINARY_SLICE = 1,
-    BUILD_TEMPLATE = 2,
-    BINARY_OP_INPLACE_ADD_UNICODE = 3,
-    CALL_FUNCTION_EX = 4,
-    CHECK_EG_MATCH = 5,
-    CHECK_EXC_MATCH = 6,
-    CLEANUP_THROW = 7,
-    DELETE_SUBSCR = 8,
-    END_FOR = 9,
-    END_SEND = 10,
-    EXIT_INIT_CHECK = 11,
-    FORMAT_SIMPLE = 12,
-    FORMAT_WITH_SPEC = 13,
-    GET_AITER = 14,
-    GET_ANEXT = 15,
-    GET_LEN = 16,
-    RESERVED = 17,
-    INTERPRETER_EXIT = 18,
-    LOAD_BUILD_CLASS = 19,
-    LOAD_LOCALS = 20,
-    MAKE_FUNCTION = 21,
-    MATCH_KEYS = 22,
-    MATCH_MAPPING = 23,
-    MATCH_SEQUENCE = 24,
-    NOP = 25,
-    NOT_TAKEN = 26,
-    POP_EXCEPT = 27,
-    POP_ITER = 28,
-    POP_TOP = 29,
-    PUSH_EXC_INFO = 30,
-    PUSH_NULL = 31,
-    RETURN_GENERATOR = 32,
-    RETURN_VALUE = 33,
-    SETUP_ANNOTATIONS = 34,
-    STORE_SLICE = 35,
-    STORE_SUBSCR = 36,
-    TO_BOOL = 37,
-    UNARY_INVERT = 38,
-    UNARY_NEGATIVE = 39,
-    UNARY_NOT = 40,
-    WITH_EXCEPT_START = 41,
-    BINARY_OP = 42,
-    BUILD_INTERPOLATION = 43,
-    BUILD_LIST = 44,
-    BUILD_MAP = 45,
-    BUILD_SET = 46,
-    BUILD_SLICE = 47,
-    BUILD_STRING = 48,
-    BUILD_TUPLE = 49,
-    CALL = 50,
-    CALL_INTRINSIC_1 = 51,
-    CALL_INTRINSIC_2 = 52,
-    CALL_KW = 53,
-    COMPARE_OP = 54,
-    CONTAINS_OP = 55,
-    CONVERT_VALUE = 56,
-    COPY = 57,
-    COPY_FREE_VARS = 58,
-    DELETE_DEREF = 59,
-    DELETE_FAST = 60,
-    DICT_MERGE = 61,
-    DICT_UPDATE = 62,
-    END_ASYNC_FOR = 63,
-    EXTENDED_ARG = 64,
-    FOR_ITER = 65,
-    GET_AWAITABLE = 66,
-    GET_ITER = 67,
-    IMPORT_FROM = 68,
-    IMPORT_NAME = 69,
-    IS_OP = 70,
-    JUMP_BACKWARD = 71,
-    JUMP_BACKWARD_NO_INTERRUPT = 72,
-    JUMP_FORWARD = 73,
-    LIST_APPEND = 74,
-    LIST_EXTEND = 75,
-    LOAD_ATTR = 76,
-    LOAD_COMMON_CONSTANT = 77,
-    LOAD_CONST = 78,
-    LOAD_DEREF = 79,
-    LOAD_FAST = 80,
-    LOAD_FAST_AND_CLEAR = 81,
-    LOAD_FAST_BORROW = 82,
-    LOAD_FAST_BORROW_LOAD_FAST_BORROW = 83,
-    LOAD_FAST_CHECK = 84,
-    LOAD_FAST_LOAD_FAST = 85,
-    LOAD_FROM_DICT_OR_DEREF = 86,
-    LOAD_FROM_DICT_OR_GLOBALS = 87,
-    LOAD_GLOBAL = 88,
-    LOAD_NAME = 89,
-    LOAD_SMALL_INT = 90,
-    LOAD_SPECIAL = 91,
-    LOAD_SUPER_ATTR = 92,
-    MAKE_CELL = 93,
-    MAP_ADD = 94,
-    MATCH_CLASS = 95,
-    POP_JUMP_IF_FALSE = 96,
-    POP_JUMP_IF_NONE = 97,
-    POP_JUMP_IF_NOT_NONE = 98,
-    POP_JUMP_IF_TRUE = 99,
-    RAISE_VARARGS = 100,
-    RERAISE = 101,
-    SEND = 102,
-    RETURN_CONST = 103, // CPython 3.13: replaces RETURN_VALUE + LOAD_CONST
-    SET_FUNCTION_ATTRIBUTE = 104,
-    SET_UPDATE = 105,
-    STORE_ATTR = 106,
-    STORE_DEREF = 107,
-    STORE_FAST = 108,
-    STORE_FAST_LOAD_FAST = 109,
-    STORE_FAST_STORE_FAST = 110,
-    STORE_GLOBAL = 111,
-    STORE_NAME = 112,
-    SWAP = 113,
-    UNPACK_EX = 114,
-    UNPACK_SEQUENCE = 115,
-    YIELD_VALUE = 116,
+    NOP = 0,
+    POP_TOP, // pop and discard
+    DUP_TOP,
+    DUP_TOP_TWO, // продублировать пару: […,a,b] -> […,a,b,a,b]
+    ROT_TWO, // swap top two
+    ROT_THREE, // TOS <-> third
 
-    RESUME = 128,
+    // --- Константы ---
+    LOAD_CONST, // arg → co_consts[arg]
+    LOAD_NONE,
+    LOAD_TRUE,
+    LOAD_FALSE,
+    LOAD_ELLIPSIS,
 
-    // Specialized opcodes (>= 129) — not all needed, but listed for completeness
-    BINARY_OP_ADD_FLOAT = 129,
-    BINARY_OP_ADD_INT = 130,
-    BINARY_OP_ADD_UNICODE = 131,
-    BINARY_OP_EXTEND = 132,
-    BINARY_OP_MULTIPLY_FLOAT = 133,
-    BINARY_OP_MULTIPLY_INT = 134,
-    BINARY_OP_SUBSCR_DICT = 135,
-    BINARY_OP_SUBSCR_GETITEM = 136,
-    BINARY_OP_SUBSCR_LIST_INT = 137,
-    BINARY_OP_SUBSCR_LIST_SLICE = 138,
-    BINARY_OP_SUBSCR_STR_INT = 139,
-    BINARY_OP_SUBSCR_TUPLE_INT = 140,
-    BINARY_OP_SUBSCR_USTR_INT = 141,
-    BINARY_OP_SUBTRACT_FLOAT = 142,
-    BINARY_OP_SUBTRACT_INT = 143,
+    // --- Имена / переменные ---
+    LOAD_NAME, // arg → co_names[arg]: locals→globals→builtins
+    STORE_NAME,
+    DELETE_NAME,
+    LOAD_FAST, // arg → индекс locals
+    STORE_FAST,
+    DELETE_FAST,
+    LOAD_DEREF, // arg → cells[arg]
+    STORE_DEREF,
+    DELETE_DEREF,
+    LOAD_CLASSDEREF, // arg → cells[arg], with unbound→NameError
+    LOAD_GLOBAL, // arg → co_names → globals→builtins
+    STORE_GLOBAL,
+    DELETE_GLOBAL,
+    MAKE_CELL, // arg: locals index → превратить в ячейку (closure)
+    COPY_FREE_VARS, // arg: число freevars, копируем из function-объекта
+    LOAD_CLOSURE, // arg: индекс cell → push Cell-объект frame.cells[arg] (создание вложенного замыкания)
 
-    // Legacy compat — we use our own opcode numbering for CALL_FUNCTION
-    // since CPython 3.13 removed it. Use high range to avoid collision.
-    CALL_FUNCTION = 200,
-    IMPORT_STAR = 201,
+    // --- Контейнеры-литералы ---
+    BUILD_TUPLE, // arg: count
+    BUILD_LIST, // arg: count
+    BUILD_SET, // arg: count
+    BUILD_MAP, // arg: count (key,value pairs on stack)
+    MAP_ADD, // dict at TOS[-2] += (k,v) top two — для dictcomp
+    SET_ADD, // set at TOS[-1]  += top
+    LIST_APPEND, // list at TOS[-1] += top  (для comprehensions)
+    BUILD_CONST_KEY_MAP, // arg: count, keys — кортеж-константа ниже значений
+    BUILD_STRING, // arg: count строк → concat
+    BUILD_SLICE, // arg: 2|3
+    UNPACK_SEQUENCE, // arg: count
+    UNPACK_EX, // arg: (before) | (after << 8) — starred assign
+    LIST_EXTEND, // list[TOS-1] += TOS (star в литерале)
+    SET_UPDATE, // set[TOS-1] |= TOS
+    DICT_UPDATE, // dict[TOS-1] |= TOS (** в литерале/вызове)
+    DICT_MERGE, // как DICT_UPDATE но TypeError на не-mapping в вызове
 
-    // Zython-specific async opcodes leveraging libxev (high range, won't conflict)
-    ZYTHON_AWAIT_IO = 240,
-    ZYTHON_ASYNC_CALL = 241,
-    ZYTHON_YIELD_XEV = 242,
-    ZYTHON_THREAD_SPAWN = 243,
-    ZYTHON_THREAD_JOIN = 244,
+    // --- Арифметика/сравнения ---
+    BINARY_OP, // arg: BinaryOp
+    UNARY_OP, // arg: UnaryOp
+    COMPARE_OP, // arg: CompareOp
+    CONTAINS_OP, // arg: 0 in / 1 not in
+    IS_OP, // arg: 0 is / 1 is not
 
-    _,
+    // --- Атрибуты/подписки ---
+    LOAD_ATTR, // arg → co_names
+    STORE_ATTR,
+    DELETE_ATTR,
+    LOAD_SUBSCR,
+    STORE_SUBSCR,
+    DELETE_SUBSCR,
 
-    pub fn hasArg(self: Opcode) bool {
-        const v = @intFromEnum(self);
-        // CPython 3.13: all instructions have args (wordcode format)
-        // Only RESUME and a few others have special handling
-        return v != @intFromEnum(Opcode.NOP) and
-            v != @intFromEnum(Opcode.POP_TOP) and
-            v != @intFromEnum(Opcode.RETURN_VALUE) and
-            v != @intFromEnum(Opcode.END_FOR) and
-            v != @intFromEnum(Opcode.UNARY_NEGATIVE) and
-            v != @intFromEnum(Opcode.UNARY_NOT) and
-            v != @intFromEnum(Opcode.UNARY_INVERT) and
-            v != @intFromEnum(Opcode.GET_ITER);
-    }
+    // --- Итерация ---
+    GET_ITER, // TOS → iterator
+    GET_LEN, // push len(TOS) (не совсем CPython… оставим только нужные)
+    FOR_ITER, // arg: rel jump (от след. инструкции) если исчерпан
+    GET_YIELD_FROM_ITER, // iter для yield from
 
-    pub fn toString(self: Opcode) []const u8 {
-        return switch (self) {
-            .CACHE => "CACHE",
-            .POP_TOP => "POP_TOP",
-            .PUSH_NULL => "PUSH_NULL",
-            .NOP => "NOP",
-            .LOAD_CONST => "LOAD_CONST",
-            .LOAD_NAME => "LOAD_NAME",
-            .LOAD_GLOBAL => "LOAD_GLOBAL",
-            .LOAD_FAST => "LOAD_FAST",
-            .STORE_NAME => "STORE_NAME",
-            .STORE_FAST => "STORE_FAST",
-            .STORE_GLOBAL => "STORE_GLOBAL",
-            .STORE_ATTR => "STORE_ATTR",
-            .LOAD_ATTR => "LOAD_ATTR",
-            .DELETE_FAST => "DELETE_FAST",
-            .DELETE_DEREF => "DELETE_DEREF",
-            .DELETE_SUBSCR => "DELETE_SUBSCR",
-            .CALL => "CALL",
-            .CALL_FUNCTION => "CALL_FUNCTION",
-            .CALL_FUNCTION_EX => "CALL_FUNCTION_EX",
-            .CALL_KW => "CALL_KW",
-            .RETURN_VALUE => "RETURN_VALUE",
-            .POP_JUMP_IF_FALSE => "POP_JUMP_IF_FALSE",
-            .POP_JUMP_IF_TRUE => "POP_JUMP_IF_TRUE",
-            .POP_JUMP_IF_NONE => "POP_JUMP_IF_NONE",
-            .POP_JUMP_IF_NOT_NONE => "POP_JUMP_IF_NOT_NONE",
-            .JUMP_FORWARD => "JUMP_FORWARD",
-            .JUMP_BACKWARD => "JUMP_BACKWARD",
-            .GET_ITER => "GET_ITER",
-            .FOR_ITER => "FOR_ITER",
-            .BUILD_LIST => "BUILD_LIST",
-            .BUILD_TUPLE => "BUILD_TUPLE",
-            .BUILD_MAP => "BUILD_MAP",
-            .BUILD_SET => "BUILD_SET",
-            .BUILD_SLICE => "BUILD_SLICE",
-            .BUILD_STRING => "BUILD_STRING",
-            .COMPARE_OP => "COMPARE_OP",
-            .CONTAINS_OP => "CONTAINS_OP",
-            .IS_OP => "IS_OP",
-            .IMPORT_NAME => "IMPORT_NAME",
-            .IMPORT_FROM => "IMPORT_FROM",
-            .IMPORT_STAR => "IMPORT_STAR",
-            .MAKE_FUNCTION => "MAKE_FUNCTION",
-            .BINARY_OP => "BINARY_OP",
-            .BINARY_SLICE => "BINARY_SLICE",
-            .STORE_SLICE => "STORE_SLICE",
-            .YIELD_VALUE => "YIELD_VALUE",
-            .RAISE_VARARGS => "RAISE_VARARGS",
-            .UNPACK_SEQUENCE => "UNPACK_SEQUENCE",
-            .UNPACK_EX => "UNPACK_EX",
-            .UNARY_NEGATIVE => "UNARY_NEGATIVE",
-            .UNARY_NOT => "UNARY_NOT",
-            .UNARY_INVERT => "UNARY_INVERT",
-            .EXTENDED_ARG => "EXTENDED_ARG",
-            .COPY => "COPY",
-            .SWAP => "SWAP",
-            .RESUME => "RESUME",
-            .SETUP_ANNOTATIONS => "SETUP_ANNOTATIONS",
-            .PUSH_EXC_INFO => "PUSH_EXC_INFO",
-            .POP_EXCEPT => "POP_EXCEPT",
-            .ZYTHON_AWAIT_IO => "ZYTHON_AWAIT_IO",
-            .ZYTHON_ASYNC_CALL => "ZYTHON_ASYNC_CALL",
-            .ZYTHON_YIELD_XEV => "ZYTHON_YIELD_XEV",
-            .ZYTHON_THREAD_SPAWN => "ZYTHON_THREAD_SPAWN",
-            .ZYTHON_THREAD_JOIN => "ZYTHON_THREAD_JOIN",
-            else => "UNKNOWN_OPCODE",
+    // --- Прыжки ---
+    JUMP_FORWARD, // arg: rel offset от конца инструкции
+    JUMP_ABSOLUTE, // arg: абсолютный pc
+    JUMP_BACKWARD, // arg: назад (GIL checkpoint)
+    POP_JUMP_IF_FALSE, // arg: absolute
+    POP_JUMP_IF_TRUE,
+    JUMP_IF_FALSE_OR_POP,
+    JUMP_IF_TRUE_OR_POP,
+    JUMP_IF_NOT_EXC_MATCH, // arg: absolute; pops (exc, match)
+
+    // --- Вызовы ---
+    CALL, // arg: nargs (младший байт) + nkw (старший байт); до него может быть KW_NAMES
+    KW_NAMES, // arg: const-idx кортежа имён kwargs (устанавливает frame.kwnames)
+    CALL_FUNCTION_EX, // TOS: kwargs dict или None, TOS-1: args tuple, TOS-2: func
+    MAKE_FUNCTION, // arg flags: 0x01 defaults 0x02 kwdefaults 0x04 closure 0x08 annotations
+    LOAD_METHOD_OPT, // (зарезервировано)
+    CALL_METHOD_OPT, // (зарезервировано)
+
+    // --- Классы ---
+    LOAD_BUILD_CLASS, // pushes builtins.__build_class__
+
+    // --- Исключения / блоки ---
+    SETUP_EXCEPT, // arg: rel target handler (Except block)
+    SETUP_FINALLY, // arg: rel target handler (Finally block)
+    SETUP_WITH, // arg: rel target; до этого вызван __enter__
+    POP_BLOCK, // снять блок
+    POP_EXCEPT, // выйти из except-обработчика (восстановить exc state)
+    RAISE, // arg: 0|1|2 (raise / raise from)
+    RAISE_AGAIN, // повторная размотка текущего handled-exc
+    END_FINALLY, // конец finally: если был pending exc — продолжить размотку
+    PUSH_EXC_INFO, // сохранить текущее исключение на стек (для except as)
+    CHECK_EXC_MATCH, // TOS=exc types, TOS-1=exc → bool (exc_info match)
+
+    // --- Импорт ---
+    IMPORT_NAME, // arg → co_names; TOS: level int, fromlist
+    IMPORT_FROM, // arg → co_names; push attr модуля (модуль остаётся ниже)
+    IMPORT_STAR,
+
+    // --- Функциональное ---
+    RETURN_VALUE,
+    YIELD_VALUE, // TOS — значение; push sent value
+    YIELD_FROM, // arg: rel target при завершении делегации; TOS-1: iter, TOS: sent
+    RESUME, // точка входа (GIL checkpoint)
+    FORMAT_VALUE, // arg: 0/1/2/3 conv flag; TOS: value или (fmt_spec, value)
+    LOAD_ASSERTION_ERROR,
+
+    // --- Аннотации (упрощённо) ---
+    STORE_ANNOTATION, // arg → co_names; store TOS в __annotations__[name]
+
+    // --- Замыкания класса ---
+    LOAD_BUILD_CLASS_DONE_PLACEHOLDER, // (зарезервировано)
+
+    // --- Стековые для comprehension/генераторов живут внутри своих фреймов ---
+
+    CACHE, // inline-кэш (зарезервировано, no-op)
+    END, // конец кода (страховка)
+    pub fn hasArg(op: Opcode) bool {
+        return switch (op) {
+            .NOP, .POP_TOP, .DUP_TOP, .DUP_TOP_TWO, .ROT_TWO, .ROT_THREE, .LOAD_NONE, .LOAD_TRUE, .LOAD_FALSE, .LOAD_ELLIPSIS, .POP_BLOCK, .POP_EXCEPT, .RAISE_AGAIN, .END_FINALLY, .GET_ITER, .GET_YIELD_FROM_ITER, .RETURN_VALUE, .YIELD_VALUE, .RESUME, .LOAD_BUILD_CLASS, .PUSH_EXC_INFO, .IMPORT_STAR, .CALL_FUNCTION_EX, .LOAD_ASSERTION_ERROR, .END, .CACHE, .LIST_EXTEND, .SET_UPDATE, .DICT_UPDATE, .DICT_MERGE, .GET_LEN => false,
+            else => true,
         };
     }
 };
 
-pub const CompareOp = enum(u8) {
-    LT = 0,
-    LE = 1,
-    EQ = 2,
-    NE = 3,
-    GT = 4,
-    GE = 5,
-    IN = 6,
-    NOT_IN = 7,
-    IS = 8,
-    IS_NOT = 9,
-    EXC_MATCH = 10,
-    BAD = 11,
-};
-
-// BinaryOp — NB_* from CPython opcode.h
 pub const BinaryOp = enum(u8) {
-    ADD = 0,
-    AND = 1,
-    FLOOR_DIVIDE = 2,
-    LSHIFT = 3,
-    MATRIX_MULT = 4,
-    MULTIPLY = 5,
-    REMAINDER = 6,
-    OR = 7,
-    POWER = 8,
-    RSHIFT = 9,
-    SUBTRACT = 10,
-    TRUE_DIVIDE = 11,
-    XOR = 12,
-    INPLACE_ADD = 13,
-    INPLACE_AND = 14,
-    INPLACE_FLOOR_DIVIDE = 15,
-    INPLACE_LSHIFT = 16,
-    INPLACE_MATRIX_MULT = 17,
-    INPLACE_MULTIPLY = 18,
-    INPLACE_REMAINDER = 19,
-    INPLACE_OR = 20,
-    INPLACE_POWER = 21,
-    INPLACE_RSHIFT = 22,
-    INPLACE_SUBTRACT = 23,
-    INPLACE_TRUE_DIVIDE = 24,
-    INPLACE_XOR = 25,
-    SUBSCR = 26, // NB_SUBSCR
+    add,
+    sub,
+    mul,
+    matmul,
+    truediv,
+    floordiv,
+    mod,
+    pow,
+    lshift,
+    rshift,
+    bit_and,
+    bit_or,
+    bit_xor,
+    // in-place variants (последние 13)
+    iadd,
+    isub,
+    imul,
+    imatmul,
+    itruediv,
+    ifloordiv,
+    imod,
+    ipow,
+    ilshift,
+    irshift,
+    ibit_and,
+    ibit_or,
+    ibit_xor,
 };
 
-pub const Instruction = struct {
-    opcode: Opcode,
-    arg: u32,
-    offset: usize,
-    lineno: ?usize = null,
-};
+pub const UnaryOp = enum(u8) { pos, neg, not, invert };
 
-pub fn disassemble(code: []const u8, allocator: std.mem.Allocator) ![]Instruction {
-    _ = allocator;
-    _ = code;
-    return &.{};
-}
+pub const CompareOp = enum(u8) { lt, le, eq, ne, gt, ge };
+
+pub const FORMAT_VALUE_WITH_SPEC: u8 = 0x04;
