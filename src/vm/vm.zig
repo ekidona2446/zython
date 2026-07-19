@@ -1154,13 +1154,14 @@ pub const VM = struct {
                             const o = self.fpop(frame);
                             const exc = try self.normalizeException(o);
                             if (exc.v == .exc) {
+                                // __context__ ставится всегда (если есть активный handled);
+                                // from лишь переключает его отображение (__suppress_context__).
+                                if (self.currentHandledExc()) |h| exc.v.exc.context = h;
                                 if (!cause.isNone()) {
                                     const cn = try self.normalizeException(cause);
                                     exc.v.exc.cause = cn;
-                                    exc.v.exc.suppress_context = true;
-                                } else if (self.currentHandledExc()) |h| {
-                                    exc.v.exc.context = h;
                                 }
+                                exc.v.exc.suppress_context = true;
                             }
                             ts.cur_exc = exc;
                             self.addTbToExc(exc, frame);

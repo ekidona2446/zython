@@ -3,7 +3,7 @@
 //! Резолвер:
 //!   1. sys.modules (кэш)
 //!   2. нативные модули (registry из stdlib/*.zig)
-//!   3. frozen/встроенный lib (vendored .py рядом с бинарём: lib/python3.13/)
+//!   3. frozen/встроенный lib (vendored .py рядом с бинарём: lib/python3.14/)
 //!   4. sys.path: каждая директория: pkg/mod.py, pkg/mod/__init__.py, ./mod.py
 //!
 //! Относительные импорты — через __package__ текущего модуля.

@@ -36,18 +36,18 @@ pub fn initModule(vm: *VM) anyerror!Obj {
     // modules
     try mset(vm, m, "modules", try rt.mkObj(rt.dict_t, .{ .dict = rt.modules }));
     // version
-    try mset(vm, m, "version", try rt.newStr("3.13.0 (zython, Zig 0.16.0)"));
+    try mset(vm, m, "version", try rt.newStr("3.14.6 (zython, Zig 0.16.0)"));
     {
         const vi = try rt.newTuple(&.{
             try rt.newInt(3),
-            try rt.newInt(13),
-            try rt.newInt(0),
+            try rt.newInt(14),
+            try rt.newInt(6),
             try rt.newStr("final"),
             try rt.newInt(0),
         });
         try mset(vm, m, "version_info", vi);
     }
-    try mset(vm, m, "hexversion", try rt.newInt(0x030D00F0));
+    try mset(vm, m, "hexversion", try rt.newInt(0x030E06F0));
     try mset(vm, m, "platform", try rt.newStr(platformStr()));
     try mset(vm, m, "maxsize", try rt.newInt(std.math.maxInt(i64)));
     try mset(vm, m, "byteorder", try rt.newStr(if (builtin.cpu.arch.endian() == .little) "little" else "big"));

@@ -502,10 +502,11 @@ pub const Compiler = struct {
             },
             .UnaryOp => |x| try self.collectExpr(scope, x.operand),
             .Lambda => |x| {
-                _ = try self.makeChildScope(scope, "<lambda>", .lambda_, x.args, &.{}, false);
+                const child = try self.makeChildScope(scope, "<lambda>", .lambda_, x.args, &.{}, false);
+                try scope.children.append(self.a, child);
                 // тело лямбды — выражение; collect:
-                const child = scope.children.items[scope.children.items.len - 1];
                 try self.collectExpr(child, x.body);
+                // дефолты вычисляются в объемлющей области (CPython symtable)
                 for (x.args.defaults) |d| try self.collectExpr(scope, d);
                 for (x.args.kw_defaults) |d| {
                     if (d) |dd| try self.collectExpr(scope, dd);
@@ -654,6 +655,29 @@ pub const Compiler = struct {
                 flags.flags.free = true;
             }
             // иначе — глобаль/builtin (LOAD_GLOBAL)
+        }
+        // Транзитивная пропагация freevar (CPython symtable: passthrough через промежуточные
+        // функциональные области): каждое имя, свободное в ребёнке и НЕ связанное у меня,
+        // должно быть потребовано как free и из моих предков (иначе MAKE_FUNCTION ребёнка
+        // не сможет собрать closure-кортеж из моих ячеек).
+        if (scope.isFunctionLike()) {
+            for (scope.children.items) |ch| {
+                for (ch.freevars.items) |fv| {
+                    const gop = try scope.syms.getOrPut(fv);
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    const sf = gop.value_ptr;
+                    if (sf.flags.assigned or sf.flags.param or sf.flags.cell or sf.flags.free or sf.flags.global) continue;
+                    if (sf.flags.nonlocal) {
+                        sf.flags.free = true;
+                        continue;
+                    }
+                    sf.flags.used = true;
+                    if (self.findInAncestors(scope, fv)) {
+                        sf.flags.free = true;
+                    }
+                    // иначе — глобальное имя: freevar'ом не становится
+                }
+            }
         }
         // наполнить cellvars/freevars списки (порядок важен: cellvars, затем freevars)
         var it2 = scope.syms.iterator();
@@ -1827,16 +1851,18 @@ pub const Compiler = struct {
     }
 
     fn parentCellIdx(self: *Compiler, scope: *Scope, name: []const u8) !u16 {
-        // в родителе символ должен быть cell
+        // frame.cells родителя = cellvars ++ freevars: имя может лежать в ЛЮБОЙ секции.
+        // (раньше здесь чеканились фантомные пустые cellvar'ы для имён из freevars —
+        // отсюда "free variable referenced before assignment")
         for (scope.cellvars.items, 0..) |n, i| {
             if (std.mem.eql(u8, n, name)) return @intCast(i);
         }
-        if (contains(scope.cellvars.items, name)) unreachable;
-        // добавить в cellvars (декларативно)
-        const idx = try self.addCellIdx(scope, name);
-        // символ должен быть помечен cell в syms (findInAncestors должен был сработать)
+        for (scope.freevars.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) return @intCast(scope.cellvars.items.len + i);
+        }
+        // до эмиссии resolveFree обязан был классифицировать имя; здесь — только cellvar
         if (scope.syms.getPtr(name)) |sp| sp.flags.cell = true;
-        return idx;
+        return self.addCellIdx(scope, name);
     }
 
     fn emitLambdaFromScope(self: *Compiler, scope: *Scope, child: *Scope, args: ast.Arguments, line: usize) CompileError!void {
@@ -2145,6 +2171,14 @@ pub fn compileSource(vm: anytype, filename: []const u8, src: []const u8, mode: F
         try tokens.append(a, t);
         if (t.type == .ENDMARKER) break;
     }
+    // NL внутри ()/[]/{} грамматику не интересует — выкидываем на уровне токен-потока
+    // (как это делает pegen). INDENT/DEDENT/NEWLINE не трогаем.
+    var filtered: std.ArrayList(lexer_mod.Token) = .empty;
+    for (tokens.items) |t| {
+        if (t.type == .NL) continue;
+        try filtered.append(a, t);
+    }
+    tokens = filtered;
     var parena = ast.ParserArena.init(a);
     var p = parser_mod.Parser.init(&parena, tokens.items);
     if (mode == .eval) {

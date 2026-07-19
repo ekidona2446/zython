@@ -17,7 +17,7 @@ const std = @import("std");
 const Runtime = runtime_mod.Runtime;
 const VM = vm_mod.VM;
 
-pub const version_string = "3.13.0";
+pub const version_string = "3.13.0-zython-v2";
 
 pub const Interpreter = struct {
     rt: *Runtime,
@@ -42,7 +42,7 @@ pub const Interpreter = struct {
             .{ .name = "os", .init = os_mod.initModule },
             .{ .name = "io", .init = io_mod.initModule },
         };
-        // lib-директория (vendored stdlib): <dir-of-exe>/lib/python3.13
+        // lib-директория (vendored stdlib): <dir-of-exe>/lib/python3.14
         rt.lib_dir = findLibDir(rt) catch null;
         const vmm = try VM.init(rt);
         vmm.gilAcquire();
@@ -74,11 +74,11 @@ pub const Interpreter = struct {
     }
 
     fn findLibDir(rt: *Runtime) !?[]const u8 {
-        // рядом с бинарём: <exe_dir>/lib/python3.13
+        // рядом с бинарём: <exe_dir>/lib/python3.14
         // полный путь себя — через std.Io.selfExePath не существует; используем /proc/self/exe на posix,
         // на windows — GetModuleFileName. std.Io 0.16: std.Io.Dir.selfExePath? Нет — используем
-        // относительный lib/python3.13 от cwd как fallback.
+        // относительный lib/python3.14 от cwd как fallback.
         _ = rt;
-        return "lib/python3.13";
+        return "lib/python3.14";
     }
 };

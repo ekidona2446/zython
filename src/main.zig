@@ -114,10 +114,10 @@ fn printHelp() void {
     const help =
         \\usage: zython [option] ... [-c cmd | -m mod | file | -] [arg] ...
         \\Options:
-        \\  -c cmd   : Program passed as string
-        \\  -m mod   : Run module as __main__
-        \\  -V, --version : Show version
-        \\  -h, --help    : Show this help
+        \\  -c cmd   : программа как строка
+        \\  -m mod   : запустить модуль как __main__
+        \\  -V, --version : версия
+        \\  -h, --help    : помощь
         \\
     ;
     std.debug.print("{s}", .{help});

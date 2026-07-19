@@ -72,7 +72,7 @@ pub const Runtime = struct {
 
     io: ?std.Io = null, // Zig 0.16 io для fs операций (main передаёт)
 
-    // директория со встроенной stdlib (vendored Lib: lib/python3.13 рядом с exe)
+    // директория со встроенной stdlib (vendored Lib: lib/python3.14 рядом с exe)
     lib_dir: ?[]const u8 = null,
 
     // argv процесса (sys.argv)

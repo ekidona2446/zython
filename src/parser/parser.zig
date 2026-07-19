@@ -327,6 +327,11 @@ pub const Parser = struct {
     }
 
     fn parseArguments(self: *Parser) ParseError!ast.Arguments {
+        return self.parseArgumentsMode(false);
+    }
+
+    /// lambda=true: голые параметры без аннотаций, остановка на ':' тела
+    fn parseArgumentsMode(self: *Parser, lambda_mode: bool) ParseError!ast.Arguments {
         var args: std.ArrayList(ast.Arg) = .empty;
         var kwonly: std.ArrayList(ast.Arg) = .empty;
         var kw_defaults: std.ArrayList(?*Expr) = .empty;
@@ -340,6 +345,7 @@ pub const Parser = struct {
         var state: State = .pos;
 
         while (self.peekType() != .RPAR) {
+            if (lambda_mode and self.peekType() == .COLON) break;
             if (self.peekType() == .DOUBLESTAR) {
                 _ = self.advance();
                 const n = try self.expect(.NAME);
@@ -371,7 +377,9 @@ pub const Parser = struct {
             }
             const n = try self.expect(.NAME);
             var ann: ?*Expr = null;
-            if (self.accept(.COLON)) |_| ann = try self.parseExpr();
+            if (!lambda_mode) {
+                if (self.accept(.COLON)) |_| ann = try self.parseExpr();
+            }
             const arg = ast.Arg{ .name = try self.dupeStr(n.text), .ann = ann };
             if (state == .pos) {
                 try args.append(self.arena.a(), arg);
@@ -1494,7 +1502,7 @@ pub const Parser = struct {
         _ = try self.expect(.KW_LAMBDA);
         var args = ast.Arguments{};
         if (self.peekType() != .COLON) {
-            args = try self.parseArguments();
+            args = try self.parseArgumentsMode(true);
         }
         _ = try self.expect(.COLON);
         const body = try self.parseExpr();

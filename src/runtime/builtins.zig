@@ -140,6 +140,37 @@ fn registerExceptions(rt: *Runtime) !void {
         if (std.mem.eql(u8, d.name, "BaseException")) rt.base_exception_t = ty;
         if (std.mem.eql(u8, d.name, "Exception")) rt.exception_t = ty;
     }
+    // getset'ы BaseException (exceptions.c: BaseException_getsets) — наследуются всеми
+    const be = rt.base_exception_t;
+    try excProp(rt, be, "__cause__", exc_get_cause);
+    try excProp(rt, be, "__context__", exc_get_context);
+    try excProp(rt, be, "__suppress_context__", exc_get_suppress);
+    try excProp(rt, be, "args", exc_get_args);
+}
+
+fn excProp(rt: *Runtime, ty: *Type, name: []const u8, comptime f: anytype) !void {
+    const prop = try rt.newProperty(.{ .fget = try rt.newBuiltin(name, object.wrapBuiltin(f)) });
+    try dictPutStartup(rt, ty.dict, name, prop);
+}
+
+fn exc_get_cause(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    return args[0].v.exc.cause orelse vm.rt.newNone();
+}
+
+fn exc_get_context(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    return args[0].v.exc.context orelse vm.rt.newNone();
+}
+
+fn exc_get_suppress(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    return vm.rt.newBool(args[0].v.exc.suppress_context);
+}
+
+fn exc_get_args(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    return vm.rt.newTuple(args[0].v.exc.args);
 }
 
 /// BaseException.__init__: сохраняет args
@@ -239,7 +270,8 @@ fn registerFunctions(rt: *Runtime) !void {
     try bd(rt, "input", bi_input);
     try bd(rt, "len", bi_len);
     try bd(rt, "repr", bi_repr);
-    try bd(rt, "str", bi_str);
+    // ВАЖНО: "str" не регистрируем функцией — это класс (bdt), str(x) идёт через pyCallType.
+    // Когда-то здесь был bd("str", bi_str), затиравший тип: type("x") is str == False.
     try bd(rt, "ascii", bi_ascii);
     try bd(rt, "iter", bi_iter);
     try bd(rt, "next", bi_next);
