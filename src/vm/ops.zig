@@ -102,6 +102,10 @@ fn descrSet(vm: *VM, attr: Obj, obj: Obj, value: Obj) anyerror!bool {
 // ============================================================
 
 pub fn pyGetAttr(vm: *VM, obj: Obj, name: []const u8) anyerror!Obj {
+    // __class__ — тип объекта (нужен enum.__repr__ и многому другому)
+    if (std.mem.eql(u8, name, "__class__")) {
+        return try vm.rt.mkObj(vm.rt.type_t, .{ .type_ = obj.ty });
+    }
     // staticmethod/classmethod: __func__ / __wrapped__ → обёрнутый callable
     if (obj.v == .staticm) {
         if (std.mem.eql(u8, name, "__func__") or std.mem.eql(u8, name, "__wrapped__")) return obj.v.staticm.callable;
@@ -237,6 +241,10 @@ pub fn pyGetAttr(vm: *VM, obj: Obj, name: []const u8) anyerror!Obj {
         if (std.mem.eql(u8, name, "__annotations__")) {
             if (f.annotations) |a| return a.*;
             return vm.rt.newDictObj();
+        }
+        // атрибуты из типа функции (напр. __get__ — function как дескриптор)
+        if (lookupClass(obj.ty, name)) |attr| {
+            return descrGet(vm, attr, obj, obj.ty);
         }
         try vm.raiseFmt("AttributeError", "'function' object has no attribute '{s}'", .{name});
         return error.PyExc;

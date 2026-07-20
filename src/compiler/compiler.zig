@@ -117,6 +117,7 @@ pub const Compiler = struct {
     rt: *Runtime,
     a: std.mem.Allocator, // арена рантайма
     filename: []const u8,
+    future_annotations: bool = false, // PEP 563: from __future__ import annotations
 
     pub fn init(rt: *Runtime, filename: []const u8) Compiler {
         return .{ .rt = rt, .a = rt.gpa, .filename = filename };
@@ -814,7 +815,8 @@ pub const Compiler = struct {
                     try self.emitStore(scope, as.target, s.lineno);
                 }
                 // аннотацию сохраняем в __annotations__ на module/class уровнях
-                if (scope.needs_name_scope and as.target.node == .Name) {
+                // (с PEP 563 — ленивые, не вычисляем)
+                if (!self.future_annotations and scope.needs_name_scope and as.target.node == .Name) {
                     try self.emitExpr(scope, as.ann);
                     self.emitOp(scope, .STORE_ANNOTATION, try self.addNameIdx(scope, as.target.node.Name.id), s.lineno);
                 } else if (scope.isFunctionLike() and as.target.node == .Name) {
@@ -998,6 +1000,14 @@ pub const Compiler = struct {
                 }
             },
             .ImportFrom => |x| {
+                // PEP 563: from __future__ import annotations — аннотации становятся ленивыми
+                if (x.module) |mn| {
+                    if (std.mem.eql(u8, mn, "__future__")) {
+                        for (x.names) |al| {
+                            if (std.mem.eql(u8, al.name, "annotations")) self.future_annotations = true;
+                        }
+                    }
+                }
                 const lvl = try self.addConst(scope, try self.rt.newInt(@intCast(x.level)));
                 self.emitOp(scope, .LOAD_CONST, lvl, x.lineno);
                 // fromlist: tuple имён

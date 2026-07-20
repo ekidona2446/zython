@@ -1528,7 +1528,6 @@ pub const VM = struct {
 
     /// type(name, bases, dict) — трёхаргументная форма (аналог type_new_3 CPython).
     pub fn buildClassFromCall(self: *VM, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
-        _ = kw;
         if (args[0].v != .str) {
             try self.raiseStr("TypeError", "type() argument 1 must be str");
             return error.PyExc;
@@ -1537,6 +1536,17 @@ pub const VM = struct {
         if (args[2].v != .dict) {
             try self.raiseStr("TypeError", "type() argument 3 must be dict");
             return error.PyExc;
+        }
+        // метакласс из bases (самый производный) — как CPython type(name, bases, dict)
+        var meta: *object.Type = self.rt.type_t;
+        for (bases) |b| {
+            if (b.v == .type_) {
+                const bmeta = b.v.type_.ty;
+                if (ops.isSubclass(bmeta, meta)) meta = bmeta;
+            }
+        }
+        if (meta != self.rt.type_t) {
+            return self.buildClassFromCallMeta(meta, args, kw);
         }
         const t = try self.rt.newUserType(args[0].v.str.bytes, self, bases, args[2].v.dict);
         return self.rt.mkObj(self.rt.type_t, .{ .type_ = t });
@@ -1563,7 +1573,29 @@ pub const VM = struct {
         };
         const t = try self.rt.newUserType(args[0].v.str.bytes, self, bases, ns_dict);
         t.ty = meta; // настоящий метакласс класса (нужен для __mro__/isinstance)
-        return self.rt.mkObj(meta, .{ .type_ = t });
+        const class_obj = try self.rt.mkObj(meta, .{ .type_ = t });
+        // PEP 487: __set_name__(owner, name) на атрибутах класса.
+        // Критично для enum: _proto_member.__set_name__ создаёт реальные члены.
+        // Ключи собираем заранее — __set_name__ может удалять атрибуты из namespace.
+        {
+            var sn_names: std.ArrayList(Obj) = .empty;
+            var sn_vals: std.ArrayList(Obj) = .empty;
+            var it = ns_dict.iterAlive();
+            while (it.next()) |e| {
+                if (ops.lookupSpecial(self, e.val.?, "__set_name__") != null) {
+                    try sn_names.append(self.gpa, e.key.?);
+                    try sn_vals.append(self.gpa, e.val.?);
+                }
+            }
+            for (sn_names.items, sn_vals.items) |nm, val| {
+                if (ops.lookupSpecial(self, val, "__set_name__")) |sn| {
+                    _ = self.pyCall(sn, &.{ class_obj, nm }, null) catch {
+                        self.currentTS().cur_exc = null;
+                    };
+                }
+            }
+        }
+        return class_obj;
     }
 
     /// Создание класса через вызов метакласса: Meta(name, bases, dict) → класс с ty=meta.

@@ -315,6 +315,8 @@ fn registerBuiltinTypes(rt: *Runtime) !void {
         try dictPutStartup(rt, rt.object_t.dict, "__new__", sm);
     }
     try bdt(rt, rt.super_t);
+    // function — дескриптор (__get__): связывается в метод при доступе через экземпляр
+    try td(rt, rt.function_t, "__get__", function_get);
     // __new__ в dict builtin-типов: нужно enum._find_data_type ('__new__' in int.__dict__).
     // Вызов типа идёт через tp_new (приоритетнее), так что это только маркер наличия.
     {
@@ -333,6 +335,16 @@ fn builtin_generic_new(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj
         return v.rt.newInstance(v.rt.object_t);
     }
     return v.rt.newInstance(args[0].v.type_);
+}
+
+/// function.__get__(obj, objtype=None): None → сама функция, иначе bound method.
+/// Делает функции дескрипторами (важно: enum._is_descriptor исключает методы из членов).
+fn function_get(vm: anytype, args: []const Obj, kw: ?KwArgs) anyerror!Obj {
+    _ = kw;
+    const v: *VM = vm;
+    const self_fn = args[0];
+    if (args.len < 2 or args[1].v == .none) return self_fn;
+    return v.rt.newMethod(args[1], self_fn);
 }
 
 /// object.__new__(cls) → новый экземпляр cls.
