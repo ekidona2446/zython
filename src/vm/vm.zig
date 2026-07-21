@@ -579,10 +579,6 @@ pub const VM = struct {
                 },
 
                 .LOAD_CONST => try frame.stack.append(self.gpa, consts[arg]),
-                .LOAD_NONE => try frame.stack.append(self.gpa, self.rt.newNone()),
-                .LOAD_TRUE => try frame.stack.append(self.gpa, self.rt.true_obj),
-                .LOAD_FALSE => try frame.stack.append(self.gpa, self.rt.false_obj),
-                .LOAD_ELLIPSIS => try frame.stack.append(self.gpa, self.rt.ellipsis_obj),
 
                 .LOAD_NAME => {
                     const name = names[arg];
@@ -728,24 +724,6 @@ pub const VM = struct {
                     const l = frame.stack.items[frame.stack.items.len - arg];
                     try l.v.list.items.append(self.gpa, item);
                 },
-                .BUILD_CONST_KEY_MAP => {
-                    const keys = consts[arg].v.tuple;
-                    const d = try self.rt.newDictObj();
-                    // значения лежат на стеке в прямом порядке (v1..vn сверху вниз);
-                    // выгребаем в буфер и вставляем в исходном порядке — dict сохраняет insertion order
-                    const tmp = try self.gpa.alloc(Obj, keys.len);
-                    defer self.gpa.free(tmp);
-                    var j: usize = keys.len;
-                    while (j > 0) {
-                        j -= 1;
-                        tmp[j] = self.fpop(frame);
-                    }
-                    for (keys, 0..) |key, i| {
-                        const h = try self.pyHash(key);
-                        try d.v.dict.setWithHash(self, key, tmp[i], h);
-                    }
-                    try frame.stack.append(self.gpa, d);
-                },
                 .BUILD_STRING => {
                     var buf: std.ArrayList(u8) = .empty;
                     const parts = try self.gpa.alloc(Obj, arg);
@@ -859,11 +837,63 @@ pub const VM = struct {
                     const r = try self.pyBinaryOp(bop, a, b);
                     try frame.stack.append(self.gpa, r);
                 },
-                .UNARY_OP => {
+                .CALL_INTRINSIC_1 => {
                     const a = self.fpop(frame);
-                    const uop: opcode_mod.UnaryOp = @enumFromInt(@as(u8, @truncate(arg)));
-                    const r = try self.pyUnaryOp(uop, a);
+                    switch (@as(u8, @truncate(arg))) {
+                        opcode_mod.INTRINSIC_IMPORT_STAR => {
+                            if (a.v == .module) {
+                                var it = a.v.module.dict.iterAlive();
+                                while (it.next()) |e| {
+                                    if (e.key.?.v == .str) {
+                                        const k = e.key.?.v.str.bytes;
+                                        if (k.len > 0 and k[0] == '_') continue;
+                                        if (frame.locals_dict) |ld| {
+                                            try ops.dictSetStr(ld, self, k, e.val.?);
+                                        }
+                                    }
+                                }
+                            }
+                            try frame.stack.append(self.gpa, self.rt.newNone());
+                        },
+                        opcode_mod.INTRINSIC_UNARY_POSITIVE => {
+                            if (ops.lookupSpecial(self, a, "__pos__")) |m| {
+                                try frame.stack.append(self.gpa, try self.pyCall(m, &.{}, null));
+                            } else switch (a.v) {
+                                .int, .bigint, .float => try frame.stack.append(self.gpa, a),
+                                .bool_ => |b| try frame.stack.append(self.gpa, try self.rt.newInt(@intFromBool(b))),
+                                else => {
+                                    try self.raiseFmt("TypeError", "bad operand type for unary +: '{s}'", .{a.ty.name});
+                                    return error.PyExc;
+                                },
+                            }
+                        },
+                        else => {
+                            try self.raiseFmt("SystemError", "unsupported intrinsic1 {d}", .{arg});
+                            return error.PyExc;
+                        },
+                    }
+                },
+                .UNARY_INVERT => {
+                    const a = self.fpop(frame);
+                    const r = try self.pyUnaryInvert(a);
                     try frame.stack.append(self.gpa, r);
+                },
+                .UNARY_NEGATIVE => {
+                    const a = self.fpop(frame);
+                    const r = try self.pyUnaryNegative(a);
+                    try frame.stack.append(self.gpa, r);
+                },
+                .UNARY_NOT => {
+                    const a = self.fpop(frame);
+                    if (a.v != .bool_) {
+                        try self.raiseStr("SystemError", "UNARY_NOT expects bool");
+                        return error.PyExc;
+                    }
+                    try frame.stack.append(self.gpa, self.rt.newBool(!a.v.bool_));
+                },
+                .TO_BOOL => {
+                    const a = self.fpop(frame);
+                    try frame.stack.append(self.gpa, self.rt.newBool(try self.pyTruthy(a)));
                 },
                 .COMPARE_OP => {
                     const b = self.fpop(frame);
@@ -902,12 +932,6 @@ pub const VM = struct {
                     const o = self.fpop(frame);
                     try ops.pyDelAttr(self, o, names[arg]);
                 },
-                .LOAD_SUBSCR => {
-                    const sub = self.fpop(frame);
-                    const o = self.fpop(frame);
-                    const v = try self.pyGetItem(o, sub);
-                    try frame.stack.append(self.gpa, v);
-                },
                 .STORE_SUBSCR => {
                     const sub = self.fpop(frame);
                     const o = self.fpop(frame);
@@ -941,7 +965,6 @@ pub const VM = struct {
                 },
 
                 .JUMP_FORWARD => frame.ip += arg,
-                .JUMP_ABSOLUTE => frame.ip = arg,
                 .JUMP_BACKWARD => {
                     frame.ip -= arg;
                     self.gilCheckpoint(ts);
@@ -950,49 +973,73 @@ pub const VM = struct {
                     const v = self.fpop(frame);
                     const t = try self.pyTruthy(v);
                     const want_true = op == .POP_JUMP_IF_TRUE;
-                    if (t == want_true) frame.ip = arg;
-                },
-                .JUMP_IF_FALSE_OR_POP, .JUMP_IF_TRUE_OR_POP => {
-                    const v = self.ftop(frame);
-                    const t = try self.pyTruthy(v);
-                    const want_true = op == .JUMP_IF_TRUE_OR_POP;
-                    if (t == want_true) {
-                        frame.ip = arg;
-                    } else {
-                        _ = self.fpop(frame);
-                    }
-                },
-                .JUMP_IF_NOT_EXC_MATCH => {
-                    // стек: […, exc, exc_dup, type]; на любой ветке остаётся […, exc]
-                    const match = self.fpop(frame); // тип исключения (сверху)
-                    const exc = self.fpop(frame); // дубликат исключения
-                    const m = try self.excMatches(exc, match);
-                    if (!m) frame.ip = arg;
+                    if (t == want_true) frame.ip = pc + 3 + arg;
                 },
 
-                .KW_NAMES => {
-                    const t = consts[arg];
-                    const cnt = t.v.tuple.len;
-                    const arr = try self.gpa.alloc([]const u8, cnt);
-                    for (t.v.tuple, 0..) |s, i| arr[i] = s.v.str.bytes;
-                    frame.kwnames = arr;
-                },
                 .CALL => {
-                    const nargs: usize = arg & 0xff;
-                    const nkw: usize = arg >> 8;
-                    const total = nargs + nkw;
-                    var kw: ?KwArgs = null;
-                    if (nkw > 0) {
-                        const kn = frame.kwnames orelse &.{};
-                        frame.kwnames = null;
-                        kw = .{
-                            .names = kn,
-                            .vals = frame.stack.items[frame.stack.items.len - nkw ..],
-                        };
+                    const nargs: usize = arg;
+                    const args = frame.stack.items[frame.stack.items.len - nargs ..];
+                    const func = frame.stack.items[frame.stack.items.len - nargs - 1];
+
+                    var f: ?*object.Function = null;
+                    var self_obj: ?Obj = null;
+                    switch (func.v) {
+                        .function => |ff| f = ff,
+                        .method => |m| {
+                            if (m.func.v == .function) {
+                                f = m.func.v.function;
+                                self_obj = m.self_obj;
+                            }
+                        },
+                        else => {},
                     }
-                    // позиционные — БЕЗ kw-значений (kw отдельно)
-                    const args = frame.stack.items[frame.stack.items.len - total .. frame.stack.items.len - nkw];
+
+                    if (f) |ff| {
+                        var args2 = args;
+                        if (self_obj) |so| {
+                            const with_self = try self.gpa.alloc(Obj, args.len + 1);
+                            with_self[0] = so;
+                            @memcpy(with_self[1..], args);
+                            args2 = with_self;
+                        }
+                        if (self.depth >= MAX_RECURSION) {
+                            try self.raiseStr("RecursionError", "maximum recursion depth exceeded");
+                            return error.PyExc;
+                        }
+                        const nf = try self.makeFrame(ff, args2, null);
+                        frame.stack.shrinkRetainingCapacity(frame.stack.items.len - nargs - 1);
+                        if (ff.code.flags.generator or ff.code.flags.coroutine) {
+                            const gen = try self.rt.newGenerator(nf);
+                            try frame.stack.append(self.gpa, gen);
+                        } else {
+                            self.depth += 1;
+                            nf.depth_counted = true;
+                            try ts.frames.append(self.gpa, nf);
+                            return;
+                        }
+                    } else {
+                        const len_before = frame.stack.items.len;
+                        const result = try self.pyCallRaw(func, args, null);
+                        frame.stack.shrinkRetainingCapacity(len_before - nargs - 1);
+                        try frame.stack.append(self.gpa, result);
+                    }
+                },
+                .CALL_KW => {
+                    const total: usize = arg;
+                    const kwnames_obj = self.fpop(frame);
+                    if (kwnames_obj.v != .tuple) {
+                        try self.raiseStr("SystemError", "CALL_KW expects tuple of keyword names");
+                        return error.PyExc;
+                    }
+                    const kw_count: usize = kwnames_obj.v.tuple.len;
+                    const args = frame.stack.items[frame.stack.items.len - total .. frame.stack.items.len - kw_count];
                     const func = frame.stack.items[frame.stack.items.len - total - 1];
+                    const names_arr = try self.gpa.alloc([]const u8, kw_count);
+                    for (kwnames_obj.v.tuple, 0..) |s, i| names_arr[i] = s.v.str.bytes;
+                    const kw: ?KwArgs = .{
+                        .names = names_arr,
+                        .vals = frame.stack.items[frame.stack.items.len - kw_count ..],
+                    };
 
                     var f: ?*object.Function = null;
                     var self_obj: ?Obj = null;
@@ -1028,14 +1075,9 @@ pub const VM = struct {
                             self.depth += 1;
                             nf.depth_counted = true;
                             try ts.frames.append(self.gpa, nf);
-                            // runUntil прокрутит кадр callee, затем вернётся сюда
                             return;
                         }
                     } else {
-                        // shrink считаем от состояния стека ДО вызова: builtin может
-                        // временно растить стек caller'а (например __build_class__ →
-                        // execClassBody → runUntil кладёт return_value тела класса).
-                        // Весь этот мусор отбрасывается; результат builtin возвращает сам.
                         const len_before = frame.stack.items.len;
                         const result = try self.pyCallRaw(func, args, kw);
                         frame.stack.shrinkRetainingCapacity(len_before - total - 1);
@@ -1136,7 +1178,7 @@ pub const VM = struct {
                 .POP_EXCEPT => {
                     if (ts.handled.items.len > 0) _ = ts.handled.pop();
                 },
-                .RAISE => {
+                .RAISE_VARARGS => {
                     switch (arg) {
                         0 => {
                             const handled = self.currentHandledExc() orelse {
@@ -1177,7 +1219,7 @@ pub const VM = struct {
                         else => {},
                     }
                 },
-                .RAISE_AGAIN => {
+                .RERAISE => {
                     const handled = self.currentHandledExc() orelse {
                         try self.raiseStr("RuntimeError", "No active exception to re-raise");
                         return error.PyExc;
@@ -1198,8 +1240,9 @@ pub const VM = struct {
                     try frame.stack.append(self.gpa, handled);
                 },
                 .CHECK_EXC_MATCH => {
-                    const exc = self.fpop(frame);
+                    // стек: […, exc, exc_dup, type] -> […, exc, bool]
                     const match = self.fpop(frame);
+                    const exc = self.fpop(frame);
                     const m = try self.excMatches(exc, match);
                     try frame.stack.append(self.gpa, self.rt.newBool(m));
                 },
@@ -1240,21 +1283,6 @@ pub const VM = struct {
                     };
                     try frame.stack.append(self.gpa, v);
                 },
-                .IMPORT_STAR => {
-                    const mod = self.fpop(frame);
-                    if (mod.v == .module) {
-                        var it = mod.v.module.dict.iterAlive();
-                        while (it.next()) |e| {
-                            if (e.key.?.v == .str) {
-                                const k = e.key.?.v.str.bytes;
-                                if (k.len > 0 and k[0] == '_') continue;
-                                if (frame.locals_dict) |ld| {
-                                    try ops.dictSetStr(ld, self, k, e.val.?);
-                                }
-                            }
-                        }
-                    }
-                },
 
                 .RETURN_VALUE => {
                     const v = self.fpop(frame);
@@ -1293,14 +1321,46 @@ pub const VM = struct {
                     frame.ip = pc;
                     return error.GenYield;
                 },
-                .FORMAT_VALUE => {
-                    var fmt_spec: ?Obj = null;
-                    if (arg & opcode_mod.FORMAT_VALUE_WITH_SPEC != 0) {
-                        fmt_spec = self.fpop(frame);
-                    }
+                .CONVERT_VALUE => {
                     const v = self.fpop(frame);
-                    const conv: u8 = @truncate(arg & 3);
-                    const s = try self.formatValue(v, conv, fmt_spec);
+                    const s = switch (@as(u8, @truncate(arg))) {
+                        opcode_mod.FVC_NONE, opcode_mod.FVC_STR => try ops.pyStr(self, v),
+                        opcode_mod.FVC_REPR => try ops.pyRepr(self, v),
+                        opcode_mod.FVC_ASCII => blk: {
+                            const r = try ops.pyRepr(self, v);
+                            const src = r.v.str.bytes;
+                            var out: std.ArrayList(u8) = .empty;
+                            var i: usize = 0;
+                            while (i < src.len) {
+                                const l = std.unicode.utf8ByteSequenceLength(src[i]) catch 1;
+                                if (i + l > src.len) break;
+                                const cp = std.unicode.utf8Decode(src[i .. i + l]) catch 0xFFFD;
+                                if (cp < 128) {
+                                    try out.appendSlice(self.gpa, src[i .. i + l]);
+                                } else if (cp <= 0xFF) {
+                                    try out.print(self.gpa, "\\x{x:0>2}", .{cp});
+                                } else if (cp <= 0xFFFF) {
+                                    try out.print(self.gpa, "\\u{x:0>4}", .{cp});
+                                } else {
+                                    try out.print(self.gpa, "\\U{x:0>8}", .{cp});
+                                }
+                                i += l;
+                            }
+                            break :blk try self.rt.newStrOwned(try out.toOwnedSlice(self.gpa));
+                        },
+                        else => try ops.pyStr(self, v),
+                    };
+                    try frame.stack.append(self.gpa, s);
+                },
+                .FORMAT_SIMPLE => {
+                    const v = self.fpop(frame);
+                    const s = try self.applyFormatSpec(v, "");
+                    try frame.stack.append(self.gpa, s);
+                },
+                .FORMAT_WITH_SPEC => {
+                    const fmt_spec = self.fpop(frame);
+                    const v = self.fpop(frame);
+                    const s = try self.applyFormatSpec(v, fmt_spec.v.str.bytes);
                     try frame.stack.append(self.gpa, s);
                 },
                 .STORE_ANNOTATION => _ = self.fpop(frame),
@@ -2073,7 +2133,13 @@ pub const VM = struct {
     // ============================================================
 
     pub fn pyBinaryOp(self: *VM, bop: opcode_mod.BinaryOp, a: Obj, b: Obj) anyerror!Obj {
-        const is_inplace = @intFromEnum(bop) >= @intFromEnum(opcode_mod.BinaryOp.iadd);
+        // CPython 3.14 перенёс подписку в BINARY_OP/NB_SUBSCR.
+        if (bop == .subscr) {
+            return self.pyGetItem(a, b);
+        }
+
+        const is_inplace = @intFromEnum(bop) >= @intFromEnum(opcode_mod.BinaryOp.iadd) and
+            @intFromEnum(bop) <= @intFromEnum(opcode_mod.BinaryOp.ibit_xor);
         if (is_inplace) {
             const iname = inameFor(bop);
             if (ops.lookupSpecial(self, a, iname)) |im| {
@@ -2566,56 +2632,65 @@ pub const VM = struct {
         }
     }
 
-    pub fn pyUnaryOp(self: *VM, uop: opcode_mod.UnaryOp, a: Obj) anyerror!Obj {
-        switch (uop) {
-            .not => return self.rt.newBool(!(try self.pyTruthy(a))),
-            .neg => switch (a.v) {
-                .int => |v| {
-                    if (v == std.math.minInt(i64)) {
-                        return self.bigUnary(.neg, a);
-                    }
-                    return self.rt.newInt(-v);
-                },
-                .bool_ => |v| return self.rt.newInt(-@as(i64, @intFromBool(v))),
-                .float => |v| return self.rt.newFloat(-v),
-                .bigint => return self.bigUnary(.neg, a),
-                else => {},
+    pub fn pyUnaryNegative(self: *VM, a: Obj) anyerror!Obj {
+        switch (a.v) {
+            .int => |v| {
+                if (v == std.math.minInt(i64)) {
+                    return self.bigNeg(a);
+                }
+                return self.rt.newInt(-v);
             },
-            .pos => switch (a.v) {
-                .int, .bigint, .float => return a,
-                .bool_ => |v| return self.rt.newInt(@intFromBool(v)),
-                else => {},
-            },
-            .invert => switch (a.v) {
-                .int => |v| return self.rt.newInt(~v),
-                .bool_ => |v| return self.rt.newInt(~@as(i64, @intFromBool(v))),
-                .bigint => return self.bigUnary(.invert, a),
-                else => {},
-            },
+            .bool_ => |v| return self.rt.newInt(-@as(i64, @intFromBool(v))),
+            .float => |v| return self.rt.newFloat(-v),
+            .bigint => return self.bigNeg(a),
+            else => {},
         }
-        const name = switch (uop) {
-            .neg => "__neg__",
-            .pos => "__pos__",
-            .invert => "__invert__",
-            .not => "?",
-        };
-        if (ops.lookupSpecial(self, a, name)) |m| {
+        if (ops.lookupSpecial(self, a, "__neg__")) |m| {
             return self.pyCall(m, &.{}, null);
         }
-        try self.raiseFmt("TypeError", "bad operand type for unary {s}: '{s}'", .{ name, a.ty.name });
+        try self.raiseFmt("TypeError", "bad operand type for unary -: '{s}'", .{a.ty.name});
         return error.PyExc;
     }
 
-    fn bigUnary(self: *VM, uop: opcode_mod.UnaryOp, a: Obj) anyerror!Obj {
+    pub fn pyUnaryInvert(self: *VM, a: Obj) anyerror!Obj {
+        switch (a.v) {
+            .int => |v| return self.rt.newInt(~v),
+            .bool_ => |v| return self.rt.newInt(~@as(i64, @intFromBool(v))),
+            .bigint => return self.bigInvert(a),
+            else => {},
+        }
+        if (ops.lookupSpecial(self, a, "__invert__")) |m| {
+            return self.pyCall(m, &.{}, null);
+        }
+        try self.raiseFmt("TypeError", "bad operand type for unary ~: '{s}'", .{a.ty.name});
+        return error.PyExc;
+    }
+
+    fn bigNeg(self: *VM, a: Obj) anyerror!Obj {
         const g = self.gpa;
-        var ba: *object.Big = undefined;
-        if (a.v == .bigint) {
-            ba = a.v.bigint;
-        } else return error.TypeErr;
-        _ = uop;
+        const ba: *object.Big = switch (a.v) {
+            .bigint => |b| b,
+            else => return error.TypeErr,
+        };
         var r = try object.bigFromI64(g, 0);
         try r.copy(ba.toConst());
         r.negate();
+        if (r.toInt(i64)) |v| {
+            r.deinit();
+            return self.rt.newInt(v);
+        } else |_| {}
+        return self.rt.newBig(r);
+    }
+
+    fn bigInvert(self: *VM, a: Obj) anyerror!Obj {
+        const g = self.gpa;
+        const ba: *object.Big = switch (a.v) {
+            .bigint => |b| b,
+            else => return error.TypeErr,
+        };
+        const minus_one = try object.bigFromI64(g, -1);
+        var r = try object.bigFromI64(g, 0);
+        try r.sub(minus_one, ba);
         if (r.toInt(i64)) |v| {
             r.deinit();
             return self.rt.newInt(v);

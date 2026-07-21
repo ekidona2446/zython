@@ -183,15 +183,29 @@ pub const Compiler = struct {
         self.emitOp(scope, op, 0, line);
     }
 
+    fn emitConstObj(self: *Compiler, scope: *Scope, obj: Obj, line: usize) !void {
+        self.emitOp(scope, .LOAD_CONST, try self.addConst(scope, obj), line);
+    }
+
+    fn emitNone(self: *Compiler, scope: *Scope, line: usize) !void {
+        try self.emitConstObj(scope, self.rt.newNone(), line);
+    }
+
+    fn emitTrue(self: *Compiler, scope: *Scope, line: usize) !void {
+        try self.emitConstObj(scope, self.rt.true_obj, line);
+    }
+
+    fn emitFalse(self: *Compiler, scope: *Scope, line: usize) !void {
+        try self.emitConstObj(scope, self.rt.false_obj, line);
+    }
+
+    fn emitEllipsis(self: *Compiler, scope: *Scope, line: usize) !void {
+        try self.emitConstObj(scope, self.rt.ellipsis_obj, line);
+    }
+
     fn pos(self: *Compiler, scope: *Scope) usize {
         _ = self;
         return scope.code.items.len;
-    }
-
-    fn patchAbs(self: *Compiler, scope: *Scope, at: usize, target: usize) void {
-        _ = self;
-        scope.code.items[at + 1] = @truncate(target & 0xff);
-        scope.code.items[at + 2] = @truncate(target >> 8);
     }
 
     fn patchRel(self: *Compiler, scope: *Scope, at: usize, target: usize) void {
@@ -829,12 +843,12 @@ pub const Compiler = struct {
                 self.emitOp(scope, .POP_JUMP_IF_FALSE, 0xffff, s.lineno);
                 try self.emitStmts(scope, x.body);
                 const end_jump = self.pos(scope);
-                self.emitOp(scope, .JUMP_ABSOLUTE, 0xffff, s.lineno);
+                self.emitOp(scope, .JUMP_FORWARD, 0xffff, s.lineno);
                 const else_target = self.pos(scope);
-                self.patchAbs(scope, else_jump, else_target);
+                self.patchRel(scope, else_jump, else_target);
                 try self.emitStmts(scope, x.or_else);
                 const end_target = self.pos(scope);
-                self.patchAbs(scope, end_jump, end_target);
+                self.patchRel(scope, end_jump, end_target);
             },
             .While => |x| {
                 const loop_start = self.pos(scope);
@@ -845,7 +859,7 @@ pub const Compiler = struct {
                 try self.emitStmts(scope, x.body);
                 self.emitBackJump(scope, loop_start, s.lineno);
                 const else_target = self.pos(scope);
-                self.patchAbs(scope, exit_jump, else_target);
+                self.patchRel(scope, exit_jump, else_target);
                 try self.emitStmts(scope, x.or_else);
                 const end_target = self.pos(scope);
                 try self.blocks_pop(scope, end_target);
@@ -870,14 +884,14 @@ pub const Compiler = struct {
             },
             .Raise => |x| {
                 if (x.exc == null) {
-                    self.emitOp(scope, .RAISE, 0, s.lineno);
+                    self.emitOp(scope, .RAISE_VARARGS, 0, s.lineno);
                 } else {
                     try self.emitExpr(scope, x.exc.?);
                     if (x.cause) |c| {
                         try self.emitExpr(scope, c);
-                        self.emitOp(scope, .RAISE, 2, s.lineno);
+                        self.emitOp(scope, .RAISE_VARARGS, 2, s.lineno);
                     } else {
-                        self.emitOp(scope, .RAISE, 1, s.lineno);
+                        self.emitOp(scope, .RAISE_VARARGS, 1, s.lineno);
                     }
                 }
             },
@@ -889,7 +903,7 @@ pub const Compiler = struct {
                     try self.blocks_push_finally(scope, x.finalbody);
                     try self.emitStmts(scope, x.body);
                     self.emit0(scope, .POP_BLOCK, s.lineno);
-                    self.emit0(scope, .LOAD_NONE, s.lineno);
+                    try self.emitNone(scope, s.lineno);
                     const handler = self.pos(scope);
                     self.patchRel(scope, setup_pos, handler);
                     try self.blocks_pop_finally_for_fallthrough(scope, x.finalbody);
@@ -929,8 +943,9 @@ pub const Compiler = struct {
                         } else {
                             self.emit0(scope, .DUP_TOP, hline);
                             try self.emitExpr(scope, h.typ.?);
+                            self.emit0(scope, .CHECK_EXC_MATCH, hline);
                             const next_jump = self.pos(scope);
-                            self.emitOp(scope, .JUMP_IF_NOT_EXC_MATCH, 0xffff, hline);
+                            self.emitOp(scope, .POP_JUMP_IF_FALSE, 0xffff, hline);
                             // matched: стек [exc]
                             if (h.name) |n| {
                                 try self.emitStoreName(scope, n, hline);
@@ -946,17 +961,17 @@ pub const Compiler = struct {
                             self.emitOp(scope, .JUMP_FORWARD, 0xffff, hline);
                             try raise_again_jumps.append(self.a, j);
                             const next_target = self.pos(scope);
-                            self.patchAbs(scope, next_jump, next_target);
+                            self.patchRel(scope, next_jump, next_target);
                         }
                     }
-                    self.emitOp(scope, .RAISE_AGAIN, 0, s.lineno);
+                    self.emitOp(scope, .RERAISE, 0, s.lineno);
                     const end_target = self.pos(scope);
                     for (raise_again_jumps.items) |j| self.patchRel(scope, j, end_target);
                     self.patchRel(scope, end_jump, end_target);
                     if (x.finalbody.len > 0) {
                         // fallthrough к finally: POP_BLOCK + None + suite + END_FINALLY
                         self.emit0(scope, .POP_BLOCK, s.lineno);
-                        self.emit0(scope, .LOAD_NONE, s.lineno);
+                        try self.emitNone(scope, s.lineno);
                         const fhandler = self.pos(scope);
                         self.patchRel(scope, finally_setup.?, fhandler);
                         try self.blocks_pop_finally_for_fallthrough(scope, x.finalbody);
@@ -973,15 +988,15 @@ pub const Compiler = struct {
                     try self.emitExpr(scope, m);
                     self.emitOp(scope, .CALL, 1, s.lineno);
                 }
-                self.emitOp(scope, .RAISE, 1, s.lineno);
+                self.emitOp(scope, .RAISE_VARARGS, 1, s.lineno);
                 const ok_target = self.pos(scope);
-                self.patchAbs(scope, ok_jump, ok_target);
+                self.patchRel(scope, ok_jump, ok_target);
             },
             .Import => |aliases| {
                 for (aliases) |al| {
                     const lvl = try self.addConst(scope, try self.rt.newInt(0));
                     self.emitOp(scope, .LOAD_CONST, lvl, s.lineno);
-                    self.emitOp(scope, .LOAD_NONE, 0, s.lineno);
+                    try self.emitNone(scope, s.lineno);
                     self.emitOp(scope, .IMPORT_NAME, try self.addNameIdx(scope, al.name), s.lineno);
                     if (al.asname) |asn| {
                         // import a.b as x → нужен a.b сам (не верхнеуровневый a)
@@ -1020,7 +1035,8 @@ pub const Compiler = struct {
                 const modname = x.module orelse "";
                 self.emitOp(scope, .IMPORT_NAME, try self.addNameIdx(scope, modname), x.lineno);
                 if (x.names.len == 1 and std.mem.eql(u8, x.names[0].name, "*")) {
-                    self.emit0(scope, .IMPORT_STAR, x.lineno);
+                    self.emitOp(scope, .CALL_INTRINSIC_1, opcode_mod.INTRINSIC_IMPORT_STAR, x.lineno);
+                    self.emit0(scope, .POP_TOP, x.lineno);
                 } else {
                     for (x.names) |al| {
                         self.emitOp(scope, .IMPORT_FROM, try self.addNameIdx(scope, al.name), x.lineno);
@@ -1071,18 +1087,19 @@ pub const Compiler = struct {
                 for (x.keywords) |kw| {
                     try self.emitExpr(scope, kw.value);
                 }
-                if (x.keywords.len > 0) {
-                    // KW_NAMES tuple
+                const nargs: u16 = @intCast(2 + x.bases.len);
+                const nkw: u16 = @intCast(x.keywords.len);
+                if (nkw > 0) {
                     var names_list: std.ArrayList(Obj) = .empty;
                     for (x.keywords) |kw| {
                         try names_list.append(self.a, try self.rt.newStr(kw.name.?));
                     }
                     const tup = try self.addConst(scope, try self.rt.newTuple(names_list.items));
-                    self.emitOp(scope, .KW_NAMES, tup, s.lineno);
+                    self.emitOp(scope, .LOAD_CONST, tup, s.lineno);
+                    self.emitOp(scope, .CALL_KW, nargs + nkw, s.lineno);
+                } else {
+                    self.emitOp(scope, .CALL, nargs, s.lineno);
                 }
-                const nargs: u16 = @intCast(2 + x.bases.len);
-                const nkw: u16 = @intCast(x.keywords.len);
-                self.emitOp(scope, .CALL, nargs | (nkw << 8), s.lineno);
                 // декораторы: стек [deco1, ..., decoN, cls] → CALL 1 даёт decoN(cls) и т.д.
                 for (x.decorator_list) |_| {
                     self.emitOp(scope, .CALL, 1, s.lineno);
@@ -1098,7 +1115,7 @@ pub const Compiler = struct {
                 if (v) |vv| {
                     try self.emitExpr(scope, vv);
                 } else {
-                    self.emit0(scope, .LOAD_NONE, s.lineno);
+                    try self.emitNone(scope, s.lineno);
                 }
                 self.emit0(scope, .RETURN_VALUE, s.lineno);
             },
@@ -1109,13 +1126,13 @@ pub const Compiler = struct {
             .Break => {
                 try self.emitBlockCleanups(scope, .loop);
                 const jpos = self.pos(scope);
-                self.emitOp(scope, .JUMP_ABSOLUTE, 0xffff, s.lineno);
+                self.emitOp(scope, .JUMP_FORWARD, 0xffff, s.lineno);
                 try self.recordBreakJump(scope, jpos);
             },
             .Continue => {
                 try self.emitBlockCleanups(scope, .loop);
                 const target = try self.blocks_continue_target(scope);
-                self.emitOp(scope, .JUMP_ABSOLUTE, @intCast(target), s.lineno);
+                self.emitBackJump(scope, target, s.lineno);
             },
         }
     }
@@ -1156,7 +1173,7 @@ pub const Compiler = struct {
     /// Снять loop-блок в конце цикла и пропатчить все break-переходы на end_target.
     fn blocks_pop(self: *Compiler, scope: *Scope, end_target: usize) CompileError!void {
         var blk = scope.blocks.pop() orelse return;
-        for (blk.break_jumps.items) |jpos| self.patchAbs(scope, jpos, end_target);
+        for (blk.break_jumps.items) |jpos| self.patchRel(scope, jpos, end_target);
         blk.break_jumps.deinit(self.a);
     }
 
@@ -1205,9 +1222,9 @@ pub const Compiler = struct {
                     } else {
                         self.emitOp(scope, .LOAD_FAST, blk.with_exit_slot.?, 0);
                     }
-                    self.emit0(scope, .LOAD_NONE, 0);
-                    self.emit0(scope, .LOAD_NONE, 0);
-                    self.emit0(scope, .LOAD_NONE, 0);
+                    try self.emitNone(scope, 0);
+                    try self.emitNone(scope, 0);
+                    try self.emitNone(scope, 0);
                     self.emitOp(scope, .CALL, 3, 0);
                     self.emit0(scope, .POP_TOP, 0);
                 },
@@ -1241,10 +1258,10 @@ pub const Compiler = struct {
             .Constant => |c| {
                 const idx = try self.emitConstant(scope, c, e.lineno);
                 switch (idx) {
-                    SENTINEL_NONE => self.emit0(scope, .LOAD_NONE, e.lineno),
-                    SENTINEL_TRUE => self.emit0(scope, .LOAD_TRUE, e.lineno),
-                    SENTINEL_FALSE => self.emit0(scope, .LOAD_FALSE, e.lineno),
-                    SENTINEL_ELLIPSIS => self.emit0(scope, .LOAD_ELLIPSIS, e.lineno),
+                    SENTINEL_NONE => try self.emitNone(scope, e.lineno),
+                    SENTINEL_TRUE => try self.emitTrue(scope, e.lineno),
+                    SENTINEL_FALSE => try self.emitFalse(scope, e.lineno),
+                    SENTINEL_ELLIPSIS => try self.emitEllipsis(scope, e.lineno),
                     else => self.emitOp(scope, .LOAD_CONST, idx, e.lineno),
                 }
             },
@@ -1316,13 +1333,12 @@ pub const Compiler = struct {
                             if (!isConstExpr(k.?)) allc = false;
                         }
                         if (allc) {
-                            var names_list: std.ArrayList(Obj) = .empty;
-                            for (x.keys) |k| {
-                                try names_list.append(self.a, try self.constValue(scope, k.?));
+                            self.emitOp(scope, .BUILD_MAP, 0, e.lineno);
+                            for (x.keys, x.values) |k, v| {
+                                try self.emitExpr(scope, k.?);
+                                try self.emitExpr(scope, v);
+                                self.emitOp(scope, .MAP_ADD, 2, e.lineno);
                             }
-                            const tup_const = try self.addConst(scope, try self.rt.newTuple(names_list.items));
-                            for (x.values) |v| try self.emitExpr(scope, v);
-                            self.emitOp(scope, .BUILD_CONST_KEY_MAP, tup_const, e.lineno);
                         } else {
                             self.emitOp(scope, .BUILD_MAP, 0, e.lineno);
                             for (x.keys, x.values) |k, v| {
@@ -1352,18 +1368,20 @@ pub const Compiler = struct {
                 for (x.values, 0..) |v, i| {
                     if (i + 1 < x.values.len) {
                         try self.emitExpr(scope, v);
+                        self.emit0(scope, .DUP_TOP, e.lineno);
                         const j = self.pos(scope);
                         if (is_or) {
-                            self.emitOp(scope, .JUMP_IF_TRUE_OR_POP, 0xffff, e.lineno);
+                            self.emitOp(scope, .POP_JUMP_IF_TRUE, 0xffff, e.lineno);
                         } else {
-                            self.emitOp(scope, .JUMP_IF_FALSE_OR_POP, 0xffff, e.lineno);
+                            self.emitOp(scope, .POP_JUMP_IF_FALSE, 0xffff, e.lineno);
                         }
+                        self.emit0(scope, .POP_TOP, e.lineno);
                         try end_jumps.append(self.a, j);
                     }
                 }
                 try self.emitExpr(scope, x.values[x.values.len - 1]);
                 const end_target = self.pos(scope);
-                for (end_jumps.items) |j| self.patchAbs(scope, j, end_target);
+                for (end_jumps.items) |j| self.patchRel(scope, j, end_target);
             },
             .NamedExpr => |x| {
                 try self.emitExpr(scope, x.value);
@@ -1377,13 +1395,15 @@ pub const Compiler = struct {
             },
             .UnaryOp => |x| {
                 try self.emitExpr(scope, x.operand);
-                const uop: opcode_mod.UnaryOp = switch (x.op) {
-                    .Invert => .invert,
-                    .Not => .not,
-                    .UAdd => .pos,
-                    .USub => .neg,
-                };
-                self.emitOp(scope, .UNARY_OP, @intFromEnum(uop), e.lineno);
+                switch (x.op) {
+                    .Invert => self.emit0(scope, .UNARY_INVERT, e.lineno),
+                    .USub => self.emit0(scope, .UNARY_NEGATIVE, e.lineno),
+                    .Not => {
+                        self.emit0(scope, .TO_BOOL, e.lineno);
+                        self.emit0(scope, .UNARY_NOT, e.lineno);
+                    },
+                    .UAdd => self.emitOp(scope, .CALL_INTRINSIC_1, opcode_mod.INTRINSIC_UNARY_POSITIVE, e.lineno),
+                }
             },
             .IfExp => |x| {
                 try self.emitExpr(scope, x.cond);
@@ -1391,12 +1411,12 @@ pub const Compiler = struct {
                 self.emitOp(scope, .POP_JUMP_IF_FALSE, 0xffff, e.lineno);
                 try self.emitExpr(scope, x.body);
                 const end_jump = self.pos(scope);
-                self.emitOp(scope, .JUMP_ABSOLUTE, 0xffff, e.lineno);
+                self.emitOp(scope, .JUMP_FORWARD, 0xffff, e.lineno);
                 const else_target = self.pos(scope);
-                self.patchAbs(scope, else_jump, else_target);
+                self.patchRel(scope, else_jump, else_target);
                 try self.emitExpr(scope, x.or_else);
                 const end_target = self.pos(scope);
-                self.patchAbs(scope, end_jump, end_target);
+                self.patchRel(scope, end_jump, end_target);
             },
             .Compare => |x| {
                 if (x.ops.len == 1) {
@@ -1406,22 +1426,30 @@ pub const Compiler = struct {
                 } else {
                     // chained: a < b < c
                     try self.emitExpr(scope, x.left);
-                    var end_jumps: std.ArrayList(usize) = .empty;
+                    var fail_jumps: std.ArrayList(usize) = .empty;
                     for (x.ops, 0..) |op, i| {
                         try self.emitExpr(scope, x.comparators[i]);
                         if (i + 1 < x.ops.len) {
                             self.emit0(scope, .DUP_TOP, e.lineno);
                             self.emit0(scope, .ROT_THREE, e.lineno);
                             try self.emitCmpOp(scope, op, e.lineno);
+                            self.emit0(scope, .DUP_TOP, e.lineno);
                             const j = self.pos(scope);
-                            self.emitOp(scope, .JUMP_IF_FALSE_OR_POP, 0xffff, e.lineno);
-                            try end_jumps.append(self.a, j);
+                            self.emitOp(scope, .POP_JUMP_IF_FALSE, 0xffff, e.lineno);
+                            self.emit0(scope, .POP_TOP, e.lineno);
+                            try fail_jumps.append(self.a, j);
                         } else {
                             try self.emitCmpOp(scope, op, e.lineno);
                         }
                     }
+                    const ok_jump = self.pos(scope);
+                    self.emitOp(scope, .JUMP_FORWARD, 0xffff, e.lineno);
+                    const fail_target = self.pos(scope);
+                    for (fail_jumps.items) |j| self.patchRel(scope, j, fail_target);
+                    self.emit0(scope, .ROT_TWO, e.lineno);
+                    self.emit0(scope, .POP_TOP, e.lineno);
                     const end_target = self.pos(scope);
-                    for (end_jumps.items) |j| self.patchAbs(scope, j, end_target);
+                    self.patchRel(scope, ok_jump, end_target);
                 }
             },
             .Call => |x| {
@@ -1434,7 +1462,8 @@ pub const Compiler = struct {
             .Subscript => |x| {
                 try self.emitExpr(scope, x.value);
                 try self.emitSubscript(scope, x.slice, e.lineno);
-                self.emit0(scope, .LOAD_SUBSCR, e.lineno);
+                // CPython 3.14: чтение по подписке кодируется как BINARY_OP/NB_SUBSCR.
+                self.emitOp(scope, .BINARY_OP, @intFromEnum(opcode_mod.BinaryOp.subscr), e.lineno);
             },
             .Slice => {
                 return error.SyntaxError; // голый slice вне subscript — не expression
@@ -1452,18 +1481,21 @@ pub const Compiler = struct {
             },
             .FormattedValue => |x| {
                 try self.emitExpr(scope, x.value);
-                var conv: u8 = 0;
-                conv = switch (x.conversion) {
-                    's' => 1,
-                    'r' => 2,
-                    'a' => 3,
-                    else => 0,
-                };
+                if (x.conversion != 0 and x.conversion != -1) {
+                    const conv: u8 = switch (x.conversion) {
+                        's' => opcode_mod.FVC_STR,
+                        'r' => opcode_mod.FVC_REPR,
+                        'a' => opcode_mod.FVC_ASCII,
+                        else => opcode_mod.FVC_NONE,
+                    };
+                    self.emitOp(scope, .CONVERT_VALUE, conv, e.lineno);
+                }
                 if (x.spec) |sp| {
                     try self.emitExpr(scope, sp);
-                    conv |= opcode_mod.FORMAT_VALUE_WITH_SPEC;
+                    self.emit0(scope, .FORMAT_WITH_SPEC, e.lineno);
+                } else {
+                    self.emit0(scope, .FORMAT_SIMPLE, e.lineno);
                 }
-                self.emitOp(scope, .FORMAT_VALUE, conv, e.lineno);
             },
             .Lambda => |x| {
                 const child = takeChild(scope, .lambda_, null) orelse return error.SyntaxError;
@@ -1478,14 +1510,14 @@ pub const Compiler = struct {
                 if (v) |vv| {
                     try self.emitExpr(scope, vv);
                 } else {
-                    self.emit0(scope, .LOAD_NONE, e.lineno);
+                    try self.emitNone(scope, e.lineno);
                 }
                 self.emit0(scope, .YIELD_VALUE, e.lineno);
             },
             .YieldFrom => |v| {
                 try self.emitExpr(scope, v);
                 self.emit0(scope, .GET_YIELD_FROM_ITER, e.lineno);
-                self.emit0(scope, .LOAD_NONE, e.lineno);
+                try self.emitNone(scope, e.lineno);
                 self.emitOp(scope, .YIELD_FROM, 0, e.lineno);
             },
             .ListComp => |x| {
@@ -1515,12 +1547,12 @@ pub const Compiler = struct {
             if (sl.lower) |l| {
                 try self.emitExpr(scope, l);
             } else {
-                self.emit0(scope, .LOAD_NONE, line);
+                try self.emitNone(scope, line);
             }
             if (sl.upper) |u| {
                 try self.emitExpr(scope, u);
             } else {
-                self.emit0(scope, .LOAD_NONE, line);
+                try self.emitNone(scope, line);
             }
             if (sl.step) |st| {
                 try self.emitExpr(scope, st);
@@ -1633,9 +1665,11 @@ pub const Compiler = struct {
                 try names_list.append(self.a, try self.rt.newStr(kw.name.?));
             }
             const tup = try self.addConst(scope, try self.rt.newTuple(names_list.items));
-            self.emitOp(scope, .KW_NAMES, tup, line);
+            self.emitOp(scope, .LOAD_CONST, tup, line);
+            self.emitOp(scope, .CALL_KW, nargs + nkw, line);
+        } else {
+            self.emitOp(scope, .CALL, nargs, line);
         }
-        self.emitOp(scope, .CALL, nargs | (nkw << 8), line);
     }
 
     // ----------------------------------------------------------
@@ -1719,7 +1753,7 @@ pub const Compiler = struct {
                 try self.emitExpr(scope, s.value);
                 try self.emitSubscript(scope, s.slice, line);
                 self.emit0(scope, .DUP_TOP_TWO, line);
-                self.emit0(scope, .LOAD_SUBSCR, line);
+                self.emitOp(scope, .BINARY_OP, @intFromEnum(opcode_mod.BinaryOp.subscr), line);
                 try self.emitExpr(scope, value);
                 self.emitBinOp(scope, op, true, line);
                 self.emit0(scope, .ROT_THREE, line);
@@ -1772,9 +1806,9 @@ pub const Compiler = struct {
         } else {
             self.emitOp(scope, .LOAD_FAST, slot, line);
         }
-        self.emit0(scope, .LOAD_NONE, line);
-        self.emit0(scope, .LOAD_NONE, line);
-        self.emit0(scope, .LOAD_NONE, line);
+        try self.emitNone(scope, line);
+        try self.emitNone(scope, line);
+        try self.emitNone(scope, line);
         self.emitOp(scope, .CALL, 3, line);
         self.emit0(scope, .POP_TOP, line);
         const after = self.pos(scope);
@@ -1891,7 +1925,7 @@ pub const Compiler = struct {
             try self.emitExpr(child, e);
             self.emit0(child, .RETURN_VALUE, 0);
         }
-        self.emit0(child, .LOAD_NONE, 0);
+        try self.emitNone(child, 0);
         self.emit0(child, .RETURN_VALUE, 0);
         return self.finishScope(child, child.name);
     }
@@ -1966,7 +2000,7 @@ pub const Compiler = struct {
             // на вершине стека — контейнер
             self.emit0(child, .RETURN_VALUE, 0);
         }
-        self.emit0(child, .LOAD_NONE, 0);
+        try self.emitNone(child, 0);
         self.emit0(child, .RETURN_VALUE, 0);
         return self.finishScope(child, child.name);
     }
@@ -2021,7 +2055,7 @@ pub const Compiler = struct {
             }
         }
         const skip_target = self.pos(child);
-        for (skip_jumps.items) |j| self.patchAbs(child, j, skip_target);
+        for (skip_jumps.items) |j| self.patchRel(child, j, skip_target);
         self.emitBackJump(child, loop_start, 0);
         const after = self.pos(child);
         // FOR_ITER при исчерпании сам снимает итератор со стека

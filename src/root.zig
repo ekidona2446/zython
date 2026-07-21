@@ -43,6 +43,7 @@ pub const Interpreter = struct {
         const socket_mod = @import("stdlib/socket.zig");
         const email_mod = @import("stdlib/email.zig");
         const httpclient_mod = @import("stdlib/http_client.zig");
+        const zython_std_mod = @import("stdlib/zython_std.zig");
         import_mod.native_modules = &.{
             .{ .name = "sys", .init = sys_mod.initModule },
             .{ .name = "math", .init = math_mod.initModule },
@@ -62,6 +63,9 @@ pub const Interpreter = struct {
             .{ .name = "email.utils", .init = email_mod.initUtils },
             .{ .name = "http", .init = httpclient_mod.initPackage },
             .{ .name = "http.client", .init = httpclient_mod.initModule },
+            .{ .name = "zython", .init = zython_std_mod.initPackage },
+            .{ .name = "zython.std", .init = zython_std_mod.initStdPackage },
+            .{ .name = "zython.std.io", .init = zython_std_mod.initIoModule },
         };
         // lib-директория (vendored stdlib): <dir-of-exe>/lib/python3.14
         rt.lib_dir = findLibDir(rt) catch null;

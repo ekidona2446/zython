@@ -451,7 +451,6 @@ pub const Frame = struct {
     globals: *Dict,
     builtins: *Dict,
     blocks: std.ArrayList(Block),
-    kwnames: ?[]const []const u8 = null, // установлено KW_NAMES
     generator: ?*Generator = null,
     pending_exc: ?Obj = null, // исключение, с которым вошли в finally/with-обработчик
     depth_counted: bool = false, // VM учла этот фрейм в recursion depth

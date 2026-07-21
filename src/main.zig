@@ -30,11 +30,14 @@ pub fn main(init: std.process.Init) !void {
     const interp = try zython.Interpreter.init(allocator, io);
 
     var i: usize = 1;
-    // разобрать опции
     var script: ?[]const u8 = null;
     var cmd: ?[]const u8 = null;
     var module: ?[]const u8 = null;
     var dump_src: ?[]const u8 = null;
+    var quiet = false;
+    var inspect_after = false;
+    var version_level: u8 = 0;
+
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-c")) {
@@ -55,12 +58,38 @@ pub fn main(init: std.process.Init) !void {
             module = args[i];
             i += 1;
             break;
-        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
-            printVersion();
-            return;
-        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+        } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "-?") or std.mem.eql(u8, a, "--help")) {
             printHelp();
             return;
+        } else if (std.mem.eql(u8, a, "--help-env")) {
+            printHelpEnv();
+            return;
+        } else if (std.mem.eql(u8, a, "--help-xoptions")) {
+            printHelpXOptions();
+            return;
+        } else if (std.mem.eql(u8, a, "--help-all")) {
+            printHelp();
+            printHelpEnv();
+            printHelpXOptions();
+            return;
+        } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
+            version_level = @max(version_level, 1);
+        } else if (std.mem.eql(u8, a, "-VV")) {
+            version_level = @max(version_level, 2);
+        } else if (std.mem.eql(u8, a, "-q")) {
+            quiet = true;
+        } else if (std.mem.eql(u8, a, "-i")) {
+            inspect_after = true;
+        } else if (std.mem.eql(u8, a, "-b") or std.mem.eql(u8, a, "-bb") or
+            std.mem.eql(u8, a, "-B") or std.mem.eql(u8, a, "-E") or
+            std.mem.eql(u8, a, "-I") or std.mem.eql(u8, a, "-P") or
+            std.mem.eql(u8, a, "-s") or std.mem.eql(u8, a, "-S") or
+            std.mem.eql(u8, a, "-u") or std.mem.eql(u8, a, "-v") or
+            std.mem.eql(u8, a, "-vv") or std.mem.eql(u8, a, "-O") or
+            std.mem.eql(u8, a, "-OO") or std.mem.eql(u8, a, "-x")) {
+        } else if (std.mem.eql(u8, a, "-W") or std.mem.eql(u8, a, "-X")) {
+            i += 1;
+            if (i >= args.len) fatal("Argument expected for option {s}", .{a});
         } else if (a.len > 0 and a[0] == '-') {
             fatal("Unknown option: {s}", .{a});
         } else {
@@ -69,6 +98,12 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
     }
+
+    if (version_level != 0) {
+        printVersion(version_level >= 2);
+        return;
+    }
+
     // sys.argv = остаток
     interp.rt.argv = args[i..];
     if (script) |s| {
@@ -84,40 +119,114 @@ pub fn main(init: std.process.Init) !void {
         dumpGuarded(interp, dump_src.?);
     } else if (cmd) |c| {
         runGuarded(interp, c, "<string>");
+        if (inspect_after and exit_code == 0) try repl(interp, io, quiet);
     } else if (module) |m| {
         const import_mod = zython.import_mod;
         _ = import_mod.loadModule(interp.vmm, m) catch |e| {
             handleError(interp.vmm, e);
         };
+        if (inspect_after and exit_code == 0) try repl(interp, io, quiet);
     } else if (script) |s| {
         interp.runFile(s) catch |e| {
             handleError(interp.vmm, e);
         };
+        if (inspect_after and exit_code == 0) try repl(interp, io, quiet);
     } else {
-        try repl(interp, io);
+        try repl(interp, io, quiet);
     }
     interp.rt.outFlush();
     std.process.exit(exit_code);
 }
 
-fn printVersion() void {
+fn printVersion(verbose: bool) void {
     std.debug.print("Zython {s} (compatible with Python 3.14.6)\n", .{zython.version_string});
-    std.debug.print("Zig {d}.{d}.{d}, libxev backend: {s}\n", .{
-        builtin.zig_version.major,
-        builtin.zig_version.minor,
-        builtin.zig_version.patch,
-        @tagName(xev.backend),
-    });
+    if (verbose) {
+        std.debug.print("build: Zig {d}.{d}.{d}, libxev backend: {s}, os: {s}, arch: {s}\n", .{
+            builtin.zig_version.major,
+            builtin.zig_version.minor,
+            builtin.zig_version.patch,
+            @tagName(xev.backend),
+            @tagName(builtin.os.tag),
+            @tagName(builtin.cpu.arch),
+        });
+    }
 }
 
 fn printHelp() void {
     const help =
         \\usage: zython [option] ... [-c cmd | -m mod | file | -] [arg] ...
-        \\Options:
-        \\  -c cmd   : Program passed as string
-        \\  -m mod   : Run module as __main__
-        \\  -V, --version : Show version
-        \\  -h, --help    : Show this help
+        \\
+        \\Options (CPython-compatible CLI surface, semantics still being filled in):
+        \\ -b     : issue warnings about str(bytes_instance), str(bytearray_instance)
+        \\          and comparing bytes/bytearray with str; -bb turns warnings into errors
+        \\ -B     : don't write .pyc files on import
+        \\ -c cmd : program passed in as string (terminates option list)
+        \\ -d     : dump compiled bytecode for given source snippet (Zython extension)
+        \\ -E     : ignore PYTHON* environment variables
+        \\ -h     : print this help message and exit (also -? or --help)
+        \\ -i     : inspect interactively after running script
+        \\ -I     : isolate from the user's environment (implies -E, -P and -s in CPython)
+        \\ -m mod : run library module as a script (terminates option list)
+        \\ -O     : optimization level 1
+        \\ -OO    : optimization level 2
+        \\ -P     : don't prepend a potentially unsafe path to sys.path
+        \\ -q     : don't print version/copyright banner on interactive startup
+        \\ -s     : don't add user site directory to sys.path
+        \\ -S     : don't imply 'import site' on initialization
+        \\ -u     : force stdout and stderr streams to be unbuffered
+        \\ -v     : verbose import tracing; can be supplied more than once
+        \\ -V     : print the version number and exit (also --version)
+        \\ -VV    : print extended build information and exit
+        \\ -W arg : warning control
+        \\ -x     : skip first line of source
+        \\ -X opt : set implementation-specific option
+        \\ --check-hash-based-pycs always|default|never
+        \\ --help-env      : print help about Python environment variables and exit
+        \\ --help-xoptions : print help about implementation-specific -X options and exit
+        \\ --help-all      : print complete help information and exit
+        \\
+        \\Arguments:
+        \\ file   : program read from script file
+        \\ -      : program read from stdin
+        \\ arg ...: arguments passed to program in sys.argv[1:]
+        \\
+    ;
+    std.debug.print("{s}", .{help});
+}
+
+fn printHelpEnv() void {
+    const help =
+        \\Environment variables (subset documented for CPython-compatible CLI):
+        \\ PYTHONPATH              : module search path prefix
+        \\ PYTHONHOME              : alternate <prefix> directory
+        \\ PYTHONINSPECT           : enter interactive mode after running a script
+        \\ PYTHONDONTWRITEBYTECODE : disable .pyc writes
+        \\ PYTHONUNBUFFERED        : unbuffer stdout/stderr
+        \\ PYTHONVERBOSE           : verbose import tracing
+        \\ PYTHONWARNINGS          : warning filter configuration
+        \\ PYTHONOPTIMIZE          : optimization level
+        \\ PYTHONSAFEPATH          : safe-path mode
+        \\ PYTHONNOUSERSITE        : disable user site-packages
+        \\ PYTHONDEVMODE           : development mode
+        \\
+    ;
+    std.debug.print("{s}", .{help});
+}
+
+fn printHelpXOptions() void {
+    const help =
+        \\Implementation-specific -X options accepted or planned for CPython compatibility:
+        \\ -X dev
+        \\ -X utf8[=0|1]
+        \\ -X importtime
+        \\ -X pycache_prefix=PATH
+        \\ -X warn_default_encoding
+        \\ -X no_debug_ranges
+        \\ -X frozen_modules=[on|off]
+        \\ -X perf
+        \\ -X perf_jit
+        \\
+        \\Zython note: parsing compatibility comes first; semantics are being implemented incrementally.
         \\
     ;
     std.debug.print("{s}", .{help});
@@ -210,16 +319,18 @@ pub fn printUncaught(v: *VM) void {
 // REPL
 // ============================================================
 
-fn repl(interp: *zython.Interpreter, io: std.Io) !void {
+fn repl(interp: *zython.Interpreter, io: std.Io, quiet: bool) !void {
     _ = io;
     const rt = interp.rt;
     const v = interp.vmm;
-    rt.outWrite("Zython ");
-    rt.outWrite(zython.version_string);
-    rt.outWrite(" on ");
-    rt.outWrite(@tagName(builtin.os.tag));
-    rt.outWrite("\nType \"help\", \"copyright\", \"credits\" or \"license\" for more information.\n");
-    rt.outFlush();
+    if (!quiet) {
+        rt.outWrite("Zython ");
+        rt.outWrite(zython.version_string);
+        rt.outWrite(" on ");
+        rt.outWrite(@tagName(builtin.os.tag));
+        rt.outWrite("\nType \"help\", \"copyright\", \"credits\" or \"license\" for more information.\n");
+        rt.outFlush();
+    }
     // общие globals для сессии
     const main_mod = try rt.newModuleObj("__main__");
     try zython.import_mod.sysModulesPut(v, "__main__", main_mod);
